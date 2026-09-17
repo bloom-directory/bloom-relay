@@ -4,11 +4,15 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# The HAProxy image runs as a non-root user and must traverse the temporary
+# bind mount during syntax validation.
+chmod 0755 "$fixture"
 
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$fixture/key.pem" -out "$fixture/ca.pem" -days 1 \
   -subj /CN=relay-control.bloom.directory >/dev/null 2>&1
 cat "$fixture/ca.pem" "$fixture/key.pem" > "$fixture/control.pem"
+chmod 0644 "$fixture/control.pem" "$fixture/ca.pem"
 sed -e 's/CONTROL_IP/127.0.0.2/' \
   -e 's@/etc/bloom-relay/control-haproxy.pem@/fixture/control.pem@' \
   -e 's@/etc/ssl/certs/ca-certificates.crt@/fixture/ca.pem@g' \
