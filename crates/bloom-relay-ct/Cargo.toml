@@ -6,7 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bloom-relay-store = { path = "../bloom-relay-store" }
+bloom-relay-observe = { path = "../bloom-relay-observe", version = "0.1.0" }
+bloom-relay-store = { path = "../bloom-relay-store", version = "0.1.0" }
 tokio.workspace = true
 ureq.workspace = true
 serde.workspace = true

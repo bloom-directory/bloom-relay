@@ -44,6 +44,21 @@ pub struct OutboxJob {
     pub payload: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DnsJobScope {
+    Serving,
+    Challenge,
+}
+
+impl DnsJobScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Serving => "serving",
+            Self::Challenge => "challenge",
+        }
+    }
+}
+
 impl Store {
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -62,6 +77,41 @@ impl Store {
         store.witness = Some(Arc::new(
             RestoreWitness::new(path).map_err(|error| StoreError::Witness(error.to_string()))?,
         ));
+        store.acknowledge().await?;
+        Ok(store)
+    }
+
+    /// Service startup checks schema version without taking migration locks or
+    /// requiring DDL privileges. Operators run the migrator separately.
+    pub async fn connect_runtime_with_witness(
+        url: &str,
+        path: PathBuf,
+    ) -> Result<Self, StoreError> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(16)
+            .connect(url)
+            .await?;
+        let versions: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let embedded = sqlx::migrate!("../../migrations");
+        let expected: Vec<_> = embedded
+            .migrations
+            .iter()
+            .map(|migration| (migration.version, migration.checksum.to_vec(), true))
+            .collect();
+        if versions != expected {
+            return Err(StoreError::InvalidRequest);
+        }
+        let store = Self {
+            pool,
+            witness: Some(Arc::new(
+                RestoreWitness::new(path)
+                    .map_err(|error| StoreError::Witness(error.to_string()))?,
+            )),
+        };
         store.acknowledge().await?;
         Ok(store)
     }
@@ -536,10 +586,14 @@ impl Store {
             .bind(installation_id).bind(lease_id).fetch_optional(&self.pool).await?.is_some())
     }
 
-    pub async fn claim_job(&self, placement: &str) -> Result<Option<OutboxJob>, StoreError> {
+    pub async fn claim_job(
+        &self,
+        placement: &str,
+        scope: DnsJobScope,
+    ) -> Result<Option<OutboxJob>, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT o.id, o.installation_id, o.kind, o.payload FROM outbox o JOIN installations i USING (installation_id) WHERE i.placement=$1 AND o.completed_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
-            .bind(placement).fetch_optional(&mut *tx).await?;
+        let row = sqlx::query("SELECT o.id, o.installation_id, o.kind, o.payload FROM outbox o JOIN installations i USING (installation_id) WHERE i.placement=$1 AND (($2='serving' AND o.kind IN ('publish_name','remove_records')) OR ($2='challenge' AND o.kind IN ('publish_txt','remove_txt','remove_txt_all'))) AND o.completed_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
+            .bind(placement).bind(scope.as_str()).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -558,10 +612,12 @@ impl Store {
     }
 
     pub async fn complete_job(&self, id: i64) -> Result<(), StoreError> {
+        self.verify_integrity().await?;
         sqlx::query("UPDATE outbox SET completed_at=now() WHERE id=$1")
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.acknowledge().await?;
         Ok(())
     }
 
@@ -699,6 +755,8 @@ impl Store {
             }
             sqlx::query("INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_records','{}'::jsonb)")
                 .bind(id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_txt_all','{}'::jsonb)")
+                .bind(id).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO security_audit(installation_id,event) VALUES ($1,'pending_allocation_expired')")
                 .bind(id).execute(&mut *tx).await?;
             tx.commit().await?;
@@ -776,6 +834,8 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_records','{}'::jsonb)")
+                .bind(installation_id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_txt_all','{}'::jsonb)")
                 .bind(installation_id).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'retired')")
                 .bind(installation_id).bind(operation_id).execute(&mut *tx).await?;

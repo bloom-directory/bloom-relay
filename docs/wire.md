@@ -76,6 +76,9 @@ The DNS adapter accepts only an assigned exact hostname in the delegated
 records, with 300-second address TTL. A TXT lease derives the
 `_acme-challenge.` name on the server. The control plane never accepts an
 arbitrary DNS owner/type from Broker.
+The public control API holds no AWS identity. Separate serving and challenge
+workers claim disjoint outbox job types and receive distinct Route 53 roles;
+retirement queues serving-record and TXT cleanup independently.
 The scoped DNS-01 client has create, readiness and delete operations; only
 the control service derives the record owner. Readiness requires exact TXT
 observation through configured authoritative and recursive resolvers. Broker

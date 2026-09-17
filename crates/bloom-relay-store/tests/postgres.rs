@@ -1,5 +1,5 @@
 use bloom_relay_protocol::{CertificateMetadata, ChallengeLease};
-use bloom_relay_store::{RestoreWitness, Store, StoreError, WitnessError};
+use bloom_relay_store::{DnsJobScope, RestoreWitness, Store, StoreError, WitnessError};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -281,8 +281,25 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
         .await
         .unwrap();
     let id = allocation.installation_id;
-    assert!(store.claim_job(&second_placement).await.unwrap().is_none());
-    let first_job = store.claim_job(&first_placement).await.unwrap().unwrap();
+    assert!(
+        store
+            .claim_job(&second_placement, DnsJobScope::Serving)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .claim_job(&first_placement, DnsJobScope::Challenge)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let first_job = store
+        .claim_job(&first_placement, DnsJobScope::Serving)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(first_job.installation_id, id);
     store.complete_job(first_job.id).await.unwrap();
     store
@@ -316,8 +333,18 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
     ));
     let second_generation = store.claim_tunnel(id, &second_placement, 45).await.unwrap();
     assert!(second_generation > first_generation);
-    assert!(store.claim_job(&first_placement).await.unwrap().is_none());
-    let job = store.claim_job(&second_placement).await.unwrap().unwrap();
+    assert!(
+        store
+            .claim_job(&first_placement, DnsJobScope::Serving)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let job = store
+        .claim_job(&second_placement, DnsJobScope::Serving)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(job.installation_id, id);
     assert_eq!(job.kind, "publish_name");
     assert_eq!(
@@ -348,6 +375,9 @@ async fn stale_database_revision_is_rejected_by_external_witness() {
     let witness = RestoreWitness::new(path.clone()).unwrap();
     witness.verify_and_advance(&store).await.unwrap();
     let guarded = Store::connect_with_witness(&url, path.clone())
+        .await
+        .unwrap();
+    Store::connect_runtime_with_witness(&url, path.clone())
         .await
         .unwrap();
     guarded

@@ -2,6 +2,9 @@
 
 This repository contains implementation work but is not deployed. No DNS,
 cloud, wallet or certificate mutation runs in local tests.
+The reviewable Linux release templates and role grants are in
+[`package.md`](package.md); their installation and live drills are still
+deployment actions.
 
 Before a production rollout, record the owning AWS account, Route 53 hosted
 zone ID and parent-zone NS delegation, optional DNSSEC/DS decision, ingress
@@ -12,18 +15,19 @@ DNS role must be restricted to the delegated zone and exact record types.
 The `relay-control.bloom.directory` TLS identity and offline receipt-signing
 key need separate protected provisioning and rotation procedures.
 
-The control service takes its PostgreSQL URL, bind address, placement, TLS
+The API process takes its PostgreSQL URL, bind address, placement, TLS
 certificate/key paths and raw 32-byte receipt-signing key path from
 restricted service configuration. The gateway takes PostgreSQL URL,
 gateway ID, control bind, public ingress bind and control TLS key paths.
 The gateway ID must exactly equal its shard placement. A tunnel claim at a
 different placement is rejected even with a valid scoped credential. Each DNS
 worker claims only jobs for its configured placement.
-Control also requires the delegated Route 53 hosted zone ID, comma-separated
-ingress addresses and authoritative DNS server addresses. Its DNS worker uses
-the standard AWS workload credential chain; give that role permission only
-for exact A/AAAA/CAA/TXT changes in the delegated zone. Both services require
-`BLOOM_RELAY_RESTORE_WITNESS_PATH`, an owner-only local high-water file on
+Separate `dns-serving` and `dns-challenge` workers take the delegated Route 53
+hosted zone ID, comma-separated ingress addresses and authoritative DNS server
+addresses. Give the first role only A/AAAA/CAA changes and the second only
+TXT changes under `_acme-challenge`, with distinct AWS credentials; the API
+process has no AWS credential. All services require
+`BLOOM_RELAY_RESTORE_WITNESS_PATH`, a restricted shared-group high-water file on
 storage independent of PostgreSQL snapshots. Preserve the shared witness
 across database restore. The store takes an advisory lock and advances the
 witness before acknowledging each durable identity, credential, DNS and CT
@@ -99,6 +103,6 @@ to exercise opaque Browser TLS forwarding, tunnel reconnect fencing, scoped
 credential rotation, DNS challenge leases, stale restore refusal and the CT
 alert fixture. CI provisions the disposable database. The remaining rollout
 work is CT source/adapter and alert destination configuration, real Route 53 propagation and failure
-drills, public ACME staging issuance/renewal, production service packaging,
+drills, public ACME staging issuance/renewal, reviewed service installation,
 load and incident drills, and the recorded ownership/configuration above.
 A health endpoint or local fixture alone is not production readiness evidence.

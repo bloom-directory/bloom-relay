@@ -31,7 +31,7 @@ impl RestoreWitness {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o660);
         }
         let lock = options.open(lock_path)?;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -86,7 +86,7 @@ fn read_revision(path: &Path) -> io::Result<Option<u64>> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if meta.permissions().mode() & 0o077 != 0 {
+                if meta.permissions().mode() & 0o007 != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "witness permissions",
@@ -121,7 +121,7 @@ fn write_revision(path: &Path, revision: u64) -> io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o660);
         }
         let mut file = options.open(&temporary)?;
         writeln!(file, "{revision}")?;

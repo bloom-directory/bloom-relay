@@ -6,9 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bloom-relay-observe = { path = "../bloom-relay-observe", version = "0.1.0" }
 bloom-relay-protocol.workspace = true
-bloom-relay-store = { path = "../bloom-relay-store" }
-bloom-relay-dns = { path = "../bloom-relay-dns" }
+bloom-relay-store = { path = "../bloom-relay-store", version = "0.1.0" }
+bloom-relay-dns = { path = "../bloom-relay-dns", version = "0.1.0" }
 tokio.workspace = true
 uuid.workspace = true
 serde_json.workspace = true

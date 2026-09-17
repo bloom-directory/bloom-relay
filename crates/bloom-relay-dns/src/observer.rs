@@ -76,17 +76,15 @@ impl HickoryObserver {
                     return Ok(false);
                 }
             }
-            if !record_absent(
-                resolver,
-                &format!("{}.", challenge_name(hostname)?),
-                RecordType::TXT,
-            )
-            .await
-            {
-                return Ok(false);
-            }
         }
         Ok(true)
+    }
+
+    pub async fn challenge_absent(&self, hostname: &str) -> Result<bool, DnsError> {
+        let name = format!("{}.", challenge_name(hostname)?);
+        let (authoritative, recursive) = self.resolvers()?;
+        Ok(record_absent(&authoritative, &name, RecordType::TXT).await
+            && record_absent(&recursive, &name, RecordType::TXT).await)
     }
 }
 

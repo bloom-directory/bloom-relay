@@ -12,7 +12,7 @@ use bloom_relay_protocol::{
     DnsChallengeDeleteRequest, DnsChallengeRequest, ErrorCode, ErrorEnvelope,
     InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex,
 };
-use bloom_relay_store::{RestoreWitness, Store};
+use bloom_relay_store::{DnsJobScope, RestoreWitness, Store};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use std::{
@@ -33,6 +33,7 @@ struct AppState {
 struct ApiError(StatusCode, ErrorCode, bool);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        bloom_relay_observe::count("bloom_relay_control_rejected_total");
         (
             self.0,
             Json(ErrorEnvelope {
@@ -74,6 +75,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    let mode = env::var("BLOOM_RELAY_MODE")?;
+    let health = bloom_relay_observe::install(match mode.as_str() {
+        "api" => "control-api",
+        "dns-serving" => "dns-serving",
+        "dns-challenge" => "dns-challenge",
+        _ => return Err("invalid relay control mode".into()),
+    })?;
+    if mode != "api" {
+        let scope = match mode.as_str() {
+            "dns-serving" => DnsJobScope::Serving,
+            "dns-challenge" => DnsJobScope::Challenge,
+            _ => return Err("invalid relay control mode".into()),
+        };
+        let witness_path = env::var("BLOOM_RELAY_RESTORE_WITNESS_PATH")?;
+        let store = Store::connect_runtime_with_witness(
+            &env::var("BLOOM_RELAY_DATABASE_URL")?,
+            witness_path.clone().into(),
+        )
+        .await?;
+        let witness = RestoreWitness::new(witness_path.into())?;
+        witness.verify_and_advance(&store).await?;
+        let witness_store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Err(error) = witness.verify_and_advance(&witness_store).await {
+                    tracing::error!(%error, "restore witness failed; DNS worker stopping");
+                    std::process::exit(78);
+                }
+            }
+        });
+        let worker =
+            dns_worker::DnsWorker::configured(store, env::var("BLOOM_RELAY_PLACEMENT")?, scope)
+                .await?;
+        health.set_ready(true);
+        tokio::select! { _ = worker.run() => {}, _ = shutdown_signal() => {} }
+        health.set_ready(false);
+        return Ok(());
+    }
     let bind: SocketAddr = env::var("BLOOM_RELAY_CONTROL_BIND")?.parse()?;
     let audience = env::var("BLOOM_RELAY_CONTROL_AUDIENCE")?;
     if audience != "relay-control.bloom.directory" {
@@ -86,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|_| "receipt key must be 32 raw bytes")?;
     let witness_path = env::var("BLOOM_RELAY_RESTORE_WITNESS_PATH")?;
     let state = Arc::new(AppState {
-        store: Store::connect_with_witness(
+        store: Store::connect_runtime_with_witness(
             &env::var("BLOOM_RELAY_DATABASE_URL")?,
             witness_path.clone().into(),
         )
@@ -107,9 +147,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     });
-    let worker =
-        dns_worker::DnsWorker::configured(state.store.clone(), state.placement.clone()).await?;
-    tokio::spawn(worker.run());
     let sweeper_store = state.store.clone();
     tokio::spawn(async move {
         loop {
@@ -119,12 +156,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Err(error) = sweeper_store.expire_challenge_leases(100).await {
                 tracing::warn!(%error, "challenge lease sweep failed");
             }
+            if let Ok(Some(seconds)) = sqlx::query_scalar::<_, Option<f64>>(
+                "SELECT min(extract(epoch FROM not_after-now())) FROM certificate_inventory",
+            )
+            .fetch_one(sweeper_store.pool())
+            .await
+            {
+                bloom_relay_observe::gauge(
+                    "bloom_relay_certificate_min_seconds_to_expiry",
+                    seconds,
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
     let app = Router::new()
-        .route("/health/live", get(|| async { StatusCode::OK }))
-        .route("/health/ready", get(ready))
         .route("/v1/bootstrap/challenge", post(challenge))
         .route("/v1/bootstrap/enroll", post(enroll))
         .route("/v1/credentials", post(issue_credential))
@@ -146,10 +192,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         env::var("BLOOM_RELAY_CONTROL_KEY_PATH")?,
     )
     .await?;
-    axum_server::bind_rustls(bind, tls)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    let handle = axum_server::Handle::new();
+    let mut server = Box::pin(
+        axum_server::bind_rustls(bind, tls)
+            .handle(handle.clone())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>()),
+    );
+    health.set_ready(true);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = shutdown_signal() => {
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+            server.await?;
+        },
+    }
+    health.set_ready(false);
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn authenticate_dns(
@@ -480,19 +551,6 @@ async fn renew_credential(
         operation_id: request.operation_id,
         expires_at_ms,
     }))
-}
-
-async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.store.verify_integrity().await.is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(state.store.pool())
-        .await
-    {
-        Ok(1) => StatusCode::OK,
-        _ => StatusCode::SERVICE_UNAVAILABLE,
-    }
 }
 
 async fn challenge(

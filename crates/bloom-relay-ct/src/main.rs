@@ -45,11 +45,12 @@ async fn main() -> Result<(), Error> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    let health = bloom_relay_observe::install("ct")?;
     let source = env::var("BLOOM_RELAY_CT_SOURCE")?;
     let feed_url = checked_url(&env::var("BLOOM_RELAY_CT_FEED_ORIGIN")?, true)?;
     let alert_url = checked_url(&env::var("BLOOM_RELAY_CT_ALERT_URL")?, false)?;
     let worker = Worker {
-        store: Store::connect_with_witness(
+        store: Store::connect_runtime_with_witness(
             &env::var("BLOOM_RELAY_DATABASE_URL")?,
             env::var("BLOOM_RELAY_RESTORE_WITNESS_PATH")?.into(),
         )
@@ -69,14 +70,39 @@ async fn main() -> Result<(), Error> {
     worker.store.ensure_ct_source(&worker.source).await?;
     loop {
         if let Err(error) = worker.tick().await {
+            health.set_ready(false);
+            bloom_relay_observe::count("bloom_relay_ct_tick_failed_total");
             tracing::error!(%error, "CT worker tick failed");
+        } else {
+            health.set_ready(true);
+            bloom_relay_observe::count("bloom_relay_ct_tick_success_total");
+        }
+        if let Ok(Some(seconds)) = worker.store.ct_feed_lag_seconds(&worker.source).await {
+            bloom_relay_observe::gauge("bloom_relay_ct_feed_lag_seconds", seconds as f64);
         }
         if env::var("BLOOM_RELAY_CT_ONCE").ok().as_deref() == Some("1") {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+            _ = shutdown_signal() => break,
+        }
     }
+    health.set_ready(false);
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn rustls_provider() -> Result<(), Error> {

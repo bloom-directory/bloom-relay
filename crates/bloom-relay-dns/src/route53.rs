@@ -198,7 +198,8 @@ impl Provider for Route53Provider {
     async fn retire_name(&self, hostname: &str) -> Result<(), DnsError> {
         super::validate_hostname(hostname)?;
         let mut changes = Vec::new();
-        for name in [hostname.to_owned(), challenge_name(hostname)?] {
+        let name = hostname.to_owned();
+        {
             let existing = self
                 .client
                 .list_resource_record_sets()
@@ -212,11 +213,7 @@ impl Provider for Route53Provider {
                 if record.name().trim_end_matches('.') != name {
                     continue;
                 }
-                let allowed = if name == hostname {
-                    matches!(record.r#type(), RrType::A | RrType::Aaaa | RrType::Caa)
-                } else {
-                    record.r#type() == &RrType::Txt
-                };
+                let allowed = matches!(record.r#type(), RrType::A | RrType::Aaaa | RrType::Caa);
                 if allowed {
                     changes.push(
                         Change::builder()
@@ -232,6 +229,32 @@ impl Provider for Route53Provider {
             return Ok(());
         }
         self.apply(changes).await
+    }
+
+    async fn retire_challenge(&self, hostname: &str) -> Result<(), DnsError> {
+        let name = challenge_name(hostname)?;
+        let existing = self
+            .client
+            .list_resource_record_sets()
+            .hosted_zone_id(&self.hosted_zone_id)
+            .start_record_name(&name)
+            .max_items(2)
+            .send()
+            .await
+            .map_err(|_| DnsError::Unavailable)?;
+        let Some(record) = existing.resource_record_sets().iter().find(|record| {
+            record.name().trim_end_matches('.') == name && record.r#type() == &RrType::Txt
+        }) else {
+            return Ok(());
+        };
+        self.apply(vec![
+            Change::builder()
+                .action(ChangeAction::Delete)
+                .resource_record_set(record.clone())
+                .build()
+                .map_err(|_| DnsError::InvalidChange)?,
+        ])
+        .await
     }
 }
 

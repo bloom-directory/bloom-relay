@@ -7,12 +7,15 @@ use bytes::Bytes;
 use futures_util::future::poll_fn;
 use h2::{RecvStream, SendStream, server};
 use http::{Method, Response, StatusCode};
-use rustls::{ServerConfig, server::Acceptor};
+use rustls::{
+    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    server::Acceptor,
+};
 use std::{
     collections::HashMap,
     env,
-    fs::File,
-    io::{BufReader, Cursor},
+    io::Cursor,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,6 +24,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot},
+    task::JoinSet,
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
@@ -90,13 +94,14 @@ async fn main() -> Result<(), Error> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    let health = bloom_relay_observe::install("gateway")?;
     let gateway_id = env::var("BLOOM_RELAY_GATEWAY_ID")?;
     if gateway_id.is_empty() || gateway_id.len() > 64 {
         return Err("invalid gateway ID".into());
     }
     let witness_path = env::var("BLOOM_RELAY_RESTORE_WITNESS_PATH")?;
     let gateway = Arc::new(Gateway {
-        store: Store::connect_with_witness(
+        store: Store::connect_runtime_with_witness(
             &env::var("BLOOM_RELAY_DATABASE_URL")?,
             witness_path.clone().into(),
         )
@@ -133,33 +138,78 @@ async fn main() -> Result<(), Error> {
         MAX_GATEWAY_STREAMS.min(BUFFER_BUDGET / (2 * BUFFER_PER_DIRECTION)),
     ));
     let ingress_quota = IngressQuota::new();
+    let mut connections = JoinSet::new();
+    let mut telemetry = tokio::time::interval(Duration::from_secs(15));
+    health.set_ready(true);
     tracing::info!("gateway ready");
     loop {
         tokio::select! {
+            _ = telemetry.tick() => {
+                bloom_relay_observe::gauge("bloom_relay_live_tunnels", gateway.tunnels.lock().await.len() as f64);
+                bloom_relay_observe::gauge("bloom_relay_live_streams", (MAX_GATEWAY_STREAMS.min(BUFFER_BUDGET / (2 * BUFFER_PER_DIRECTION)) - gateway.streams.available_permits()) as f64);
+            }
             accepted = control.accept() => {
                 let (tcp, _) = accepted?;
                 let Some((tcp, permit)) = admit_connection(tcp, &control_slots) else { continue; };
                 let gateway = gateway.clone();
                 let tls = tls.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = control_connection(gateway, tls, tcp).await { tracing::warn!(%error, "control connection closed"); }
+                    if let Err(error) = control_connection(gateway, tls, tcp).await {
+                        bloom_relay_observe::count("bloom_relay_control_connection_failed_total");
+                        tracing::warn!(%error, "control connection closed");
+                    }
                 });
             }
             accepted = ingress.accept() => {
                 let (tcp, peer) = accepted?;
-                if !ingress_quota.allow(peer.ip()) { continue; }
-                let Some((tcp, permit)) = admit_connection(tcp, &ingress_slots) else { continue; };
+                if !ingress_quota.allow(peer.ip()) {
+                    bloom_relay_observe::count("bloom_relay_ingress_quota_rejected_total");
+                    continue;
+                }
+                let Some((tcp, permit)) = admit_connection(tcp, &ingress_slots) else {
+                    bloom_relay_observe::count("bloom_relay_ingress_capacity_rejected_total");
+                    continue;
+                };
+                bloom_relay_observe::count("bloom_relay_ingress_accepted_total");
                 let gateway = gateway.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = browser_connection(gateway, tcp).await { tracing::debug!(%error, "browser connection closed"); }
+                    if let Err(error) = browser_connection(gateway, tcp).await {
+                        bloom_relay_observe::count("bloom_relay_browser_connection_failed_total");
+                        tracing::debug!(%error, "browser connection closed");
+                    }
                 });
             }
-            _ = tokio::signal::ctrl_c() => break,
+            _ = shutdown_signal() => break,
         }
     }
+    drop(control);
+    drop(ingress);
+    health.set_ready(false);
+    if timeout(Duration::from_secs(30), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn admit_connection(
@@ -174,10 +224,8 @@ fn admit_connection(
 }
 
 fn load_tls(cert_path: &str, key_path: &str) -> Result<ServerConfig, Error> {
-    let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
-        .collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
-        .ok_or("missing TLS key")?;
+    let certs = CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_file(key_path)?;
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
@@ -202,7 +250,10 @@ async fn control_connection(
             request = connection.accept() => request,
             _ = heartbeat.tick() => {
                 if let Some((host, tunnel)) = &active {
-                    if !gateway.store.renew_tunnel(tunnel.id, &gateway.gateway_id, tunnel.generation).await? { break; }
+                    if !gateway.store.renew_tunnel(tunnel.id, &gateway.gateway_id, tunnel.generation).await? {
+                        bloom_relay_observe::count("bloom_relay_tunnel_lease_fenced_total");
+                        break;
+                    }
                     let event = TunnelEvent::Heartbeat { version: WIRE_VERSION, generation: tunnel.generation };
                     send_data(&mut *tunnel.control.lock().await, Bytes::from(format!("{}\n", serde_json::to_string(&event)?))).await?;
                     if gateway.tunnels.lock().await.get(host).is_none_or(|current| current.generation != tunnel.generation) { break; }
@@ -269,11 +320,16 @@ async fn control_connection(
                 control: Mutex::new(control),
                 streams: Arc::new(Semaphore::new(MAX_INSTALLATION_STREAMS)),
             });
-            gateway
+            if gateway
                 .tunnels
                 .lock()
                 .await
-                .insert(host.to_owned(), tunnel.clone());
+                .insert(host.to_owned(), tunnel.clone())
+                .is_some()
+            {
+                bloom_relay_observe::count("bloom_relay_tunnel_reconnect_total");
+            }
+            bloom_relay_observe::count("bloom_relay_tunnel_claim_total");
             active = Some((host.to_owned(), tunnel));
         } else if request.method() == Method::CONNECT {
             let claim = if let Some(ticket) = request
@@ -287,9 +343,14 @@ async fn control_connection(
             };
             if let Some(ticket) = claim {
                 let same_tunnel = active.as_ref().is_some_and(|(host, tunnel)| {
-                    host == &ticket.host
-                        && tunnel.id == ticket.id
-                        && tunnel.generation == ticket.generation
+                    ticket_owner_matches(
+                        host,
+                        tunnel.id,
+                        tunnel.generation,
+                        &ticket.host,
+                        ticket.id,
+                        ticket.generation,
+                    )
                 });
                 let valid = ticket.deadline > Instant::now()
                     && same_tunnel
@@ -431,6 +492,10 @@ async fn bridge(
     mut inbound: RecvStream,
     mut outbound: SendStream<Bytes>,
 ) -> Result<(), Error> {
+    bloom_relay_observe::add(
+        "bloom_relay_browser_to_broker_bytes_total",
+        prefix.len() as u64,
+    );
     send_data(&mut outbound, Bytes::from(prefix)).await?;
     let mut browser_done = false;
     let mut tunnel_done = false;
@@ -441,11 +506,15 @@ async fn bridge(
                 read = browser.read(&mut buffer), if !browser_done => {
                     let count = read?;
                     if count == 0 { browser_done = true; outbound.send_data(Bytes::new(), true)?; }
-                    else { send_data(&mut outbound, Bytes::copy_from_slice(&buffer[..count])).await?; }
+                    else {
+                        bloom_relay_observe::add("bloom_relay_browser_to_broker_bytes_total", count as u64);
+                        send_data(&mut outbound, Bytes::copy_from_slice(&buffer[..count])).await?;
+                    }
                 }
                 frame = inbound.data(), if !tunnel_done => {
                     match frame {
                         Some(Ok(bytes)) => {
+                            bloom_relay_observe::add("bloom_relay_broker_to_browser_bytes_total", bytes.len() as u64);
                             browser.write_all(&bytes).await?;
                             inbound.flow_control().release_capacity(bytes.len())?;
                         }
@@ -466,10 +535,22 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+fn ticket_owner_matches(
+    active_host: &str,
+    active_id: Uuid,
+    active_generation: u64,
+    ticket_host: &str,
+    ticket_id: Uuid,
+    ticket_generation: u64,
+) -> bool {
+    active_host == ticket_host && active_id == ticket_id && active_generation == ticket_generation
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bloom_relay_client::{CEREMONY_UPSTREAM, TunnelClient, TunnelConfig};
+    use proptest::prelude::*;
     use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
     use sha2::{Digest, Sha256};
     use tokio::sync::watch;
@@ -566,6 +647,50 @@ mod tests {
         assert!(quota.allow_at(first, start + Duration::from_secs(60)));
     }
 
+    proptest! {
+        #[test]
+        fn ingress_quota_never_exceeds_source_or_global_budget(
+            sources in proptest::collection::vec(0u16..200, 0..7_000),
+        ) {
+            let quota = IngressQuota::new();
+            let now = Instant::now();
+            let mut accepted = [0u32; 200];
+            let mut total = 0u32;
+            for source in sources {
+                let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, (source / 256) as u8, source as u8));
+                let allowed = quota.allow_at(ip, now);
+                if allowed {
+                    accepted[source as usize] += 1;
+                    total += 1;
+                    prop_assert!(accepted[source as usize] <= 120);
+                    prop_assert!(total <= 5_000);
+                } else {
+                    prop_assert!(accepted[source as usize] == 120 || total == 5_000);
+                }
+            }
+            let next_window = now + Duration::from_secs(60);
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+            prop_assert!(quota.allow_at(ip, next_window));
+        }
+
+        #[test]
+        fn ticket_owner_requires_exact_host_installation_and_generation(
+            host_label in "[a-z0-9]{26}",
+            id_bytes in any::<[u8; 16]>(),
+            generation in any::<u64>(),
+        ) {
+            let host = format!("{host_label}.relay.bloom.directory");
+            let id = Uuid::from_bytes(id_bytes);
+            prop_assert!(ticket_owner_matches(&host, id, generation, &host, id, generation));
+            let other_host = format!("x.{host}");
+            prop_assert!(!ticket_owner_matches(&host, id, generation, &other_host, id, generation));
+            let mut other_id_bytes = id_bytes;
+            other_id_bytes[0] ^= 1;
+            prop_assert!(!ticket_owner_matches(&host, id, generation, &host, Uuid::from_bytes(other_id_bytes), generation));
+            prop_assert!(!ticket_owner_matches(&host, id, generation, &host, id, generation.wrapping_add(1)));
+        }
+    }
+
     #[tokio::test]
     async fn opaque_tls_reaches_fixed_upstream_and_reconnect_fences_old_generation() {
         let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
@@ -603,7 +728,8 @@ mod tests {
         std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
         std::fs::write(&key_path, certificate.signing_key.serialize_pem()).unwrap();
         let mut roots = RootCertStore::empty();
-        let cert = rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path).unwrap()))
+        let cert = CertificateDer::pem_file_iter(&cert_path)
+            .unwrap()
             .next()
             .unwrap()
             .unwrap();
@@ -703,11 +829,11 @@ mod tests {
         let mut browser_tls = ClientConfig::builder()
             .with_root_certificates({
                 let mut roots = RootCertStore::empty();
-                let cert =
-                    rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path).unwrap()))
-                        .next()
-                        .unwrap()
-                        .unwrap();
+                let cert = CertificateDer::pem_file_iter(&cert_path)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
                 roots.add(cert).unwrap();
                 roots
             })

@@ -1,0 +1,27 @@
+# Control IP must differ from each shard ingress IP. Browser TLS goes directly
+# to bloom-relay:443, preserving Browser source IP for gateway admission.
+# Substitute CONTROL_IP and certificate paths, then validate with haproxy -c.
+global
+  user haproxy
+  group haproxy
+
+defaults
+  mode http
+  timeout connect 10s
+  timeout client 35m
+  timeout server 35m
+  timeout tunnel 35m
+
+frontend relay_control
+  bind CONTROL_IP:443 ssl crt /etc/bloom-relay/control-haproxy.pem alpn h2,http/1.1
+  acl tunnel_open path -i /v1/tunnel
+  acl tunnel_attach method CONNECT
+  use_backend relay_tunnel if tunnel_open
+  use_backend relay_tunnel if tunnel_attach
+  default_backend relay_api
+
+backend relay_tunnel
+  server gateway 127.0.0.1:18444 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2
+
+backend relay_api
+  server api 127.0.0.1:18443 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2

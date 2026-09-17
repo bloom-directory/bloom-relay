@@ -1,0 +1,31 @@
+[Unit]
+Description=Bloom relay A/AAAA/CAA DNS worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bloom-relay-dns-serving
+Group=bloom-relay-dns-serving
+SupplementaryGroups=bloom-relay-witness
+EnvironmentFile=/etc/bloom-relay/dns-serving.env
+Environment=BLOOM_RELAY_MODE=dns-serving
+Environment=AWS_SHARED_CREDENTIALS_FILE=%d/aws
+Environment=AWS_EC2_METADATA_DISABLED=true
+LoadCredential=aws:/etc/bloom-relay/aws-serving-credentials
+ExecStart=/usr/local/libexec/bloom-relay/bloom-relay-control
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+UMask=0007
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/bloom-relay/witness
+
+[Install]
+WantedBy=multi-user.target

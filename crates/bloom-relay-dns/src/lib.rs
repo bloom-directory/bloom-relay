@@ -57,6 +57,10 @@ pub trait Provider: Send + Sync {
         &self,
         hostname: &str,
     ) -> impl std::future::Future<Output = Result<(), DnsError>> + Send;
+    fn retire_challenge(
+        &self,
+        hostname: &str,
+    ) -> impl std::future::Future<Output = Result<(), DnsError>> + Send;
 }
 
 pub fn validate_records(records: &NameRecords) -> Result<(), DnsError> {
@@ -161,7 +165,12 @@ impl Provider for MemoryProvider {
         validate_hostname(hostname)?;
         let mut state = self.inner.lock().await;
         state.names.remove(hostname);
-        state.leases.remove(hostname);
+        Ok(())
+    }
+
+    async fn retire_challenge(&self, hostname: &str) -> Result<(), DnsError> {
+        challenge_name(hostname)?;
+        self.inner.lock().await.leases.remove(hostname);
         Ok(())
     }
 }
@@ -191,5 +200,31 @@ mod tests {
         dns.delete_txt(&old).await.unwrap();
         assert_eq!(dns.txt(host).await.unwrap().value, "b");
         assert!(challenge_name("sibling.example").is_err());
+    }
+
+    #[tokio::test]
+    async fn retirement_splits_serving_and_challenge_records() {
+        let dns = MemoryProvider::default();
+        let host = "abcdefghijklmnopqrstuv2345.relay.bloom.directory";
+        dns.publish_name(NameRecords {
+            hostname: host.into(),
+            addresses: vec!["192.0.2.10".parse().unwrap()],
+            acme_account_uri: "https://acme-v02.api.letsencrypt.org/acme/acct/123".into(),
+        })
+        .await
+        .unwrap();
+        dns.create_txt(TxtLease {
+            hostname: host.into(),
+            lease_id: "lease".into(),
+            value: "value".into(),
+            expires_at_ms: 5,
+        })
+        .await
+        .unwrap();
+        dns.retire_name(host).await.unwrap();
+        assert!(dns.records(host).await.is_none());
+        assert!(dns.txt(host).await.is_some());
+        dns.retire_challenge(host).await.unwrap();
+        assert!(dns.txt(host).await.is_none());
     }
 }
