@@ -40,20 +40,26 @@ jobs:
       - run: cargo +1.85.0 check -p bloom-relay-protocol -p bloom-relay-admin-client -p bloom-relay-client --locked
   dependency-policy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check advisories bans licenses sources
       - uses: step-security/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      - run: cargo fuzz run client_hello -- -runs=1000 -max_len=65537
-      - run: cargo fuzz run control_frames -- -runs=1000 -max_len=16385
+      - run: cargo +nightly fuzz run client_hello -- -runs=1000 -max_len=65537
+      - run: cargo +nightly fuzz run control_frames -- -runs=1000 -max_len=16385
   package:
     runs-on: ubuntu-latest
     steps:
