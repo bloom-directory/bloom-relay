@@ -42,16 +42,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write
-      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check advisories bans licenses sources
-      - uses: step-security/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
