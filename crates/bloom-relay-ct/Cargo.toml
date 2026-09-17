@@ -1,0 +1,25 @@
+[package]
+name = "bloom-relay-ct"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bloom-relay-store = { path = "../bloom-relay-store" }
+tokio.workspace = true
+ureq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+url = "2.5.4"
+rustls.workspace = true
+
+[dev-dependencies]
+bloom-relay-protocol.workspace = true
+sqlx.workspace = true
+rcgen = "0.14.7"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }

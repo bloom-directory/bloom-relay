@@ -1,0 +1,28 @@
+[package]
+name = "bloom-relay"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bloom-relay-protocol.workspace = true
+bloom-relay-store = { path = "../bloom-relay-store" }
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+h2.workspace = true
+http.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls-pemfile.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+bloom-relay-client = { path = "../bloom-relay-client" }
+sha2.workspace = true
+rcgen = "0.14.7"
