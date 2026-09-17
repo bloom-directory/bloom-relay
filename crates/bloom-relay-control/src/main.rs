@@ -389,6 +389,9 @@ async fn renew_credential(
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
+    if state.store.verify_integrity().await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(state.store.pool())
         .await

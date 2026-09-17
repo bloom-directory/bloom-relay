@@ -76,6 +76,10 @@ impl Store {
         Ok(())
     }
 
+    pub async fn verify_integrity(&self) -> Result<(), StoreError> {
+        self.acknowledge().await
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -637,6 +641,7 @@ impl Store {
         gateway_id: &str,
         generation: u64,
     ) -> Result<bool, StoreError> {
+        self.verify_integrity().await?;
         let row = sqlx::query("SELECT 1 FROM tunnel_leases WHERE installation_id = $1 AND gateway_id = $2 AND generation = $3 AND expires_at > now()")
             .bind(installation_id).bind(gateway_id).bind(generation as i64).fetch_optional(&self.pool).await?;
         Ok(row.is_some())
