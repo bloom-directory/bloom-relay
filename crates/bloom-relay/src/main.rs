@@ -13,8 +13,8 @@ use std::{
     env,
     fs::File,
     io::{BufReader, Cursor},
-    net::SocketAddr,
-    sync::Arc,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -46,6 +46,37 @@ struct Gateway {
     tunnels: Mutex<HashMap<String, Arc<Tunnel>>>,
     tickets: Mutex<HashMap<String, Ticket>>,
     streams: Arc<Semaphore>,
+}
+
+struct IngressQuota {
+    state: StdMutex<(Instant, u32, HashMap<IpAddr, u32>)>,
+}
+
+impl IngressQuota {
+    fn new() -> Self {
+        Self {
+            state: StdMutex::new((Instant::now(), 0, HashMap::new())),
+        }
+    }
+    fn allow(&self, source: IpAddr) -> bool {
+        self.allow_at(source, Instant::now())
+    }
+    fn allow_at(&self, source: IpAddr, now: Instant) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if now.duration_since(state.0) >= Duration::from_secs(60) {
+            state.0 = now;
+            state.1 = 0;
+            state.2.clear();
+        }
+        if state.1 >= 5_000 || state.2.get(&source).copied().unwrap_or(0) >= 120 {
+            return false;
+        }
+        state.1 += 1;
+        *state.2.entry(source).or_default() += 1;
+        true
+    }
 }
 
 #[tokio::main]
@@ -101,6 +132,7 @@ async fn main() -> Result<(), Error> {
     let ingress_slots = Arc::new(Semaphore::new(
         MAX_GATEWAY_STREAMS.min(BUFFER_BUDGET / (2 * BUFFER_PER_DIRECTION)),
     ));
+    let ingress_quota = IngressQuota::new();
     tracing::info!("gateway ready");
     loop {
         tokio::select! {
@@ -115,7 +147,8 @@ async fn main() -> Result<(), Error> {
                 });
             }
             accepted = ingress.accept() => {
-                let (tcp, _) = accepted?;
+                let (tcp, peer) = accepted?;
+                if !ingress_quota.allow(peer.ip()) { continue; }
                 let Some((tcp, permit)) = admit_connection(tcp, &ingress_slots) else { continue; };
                 let gateway = gateway.clone();
                 tokio::spawn(async move {
@@ -510,6 +543,29 @@ mod tests {
         assert_eq!(slots.available_permits(), 1);
     }
 
+    #[test]
+    fn ingress_quota_bounds_source_and_global_handshakes() {
+        let quota = IngressQuota::new();
+        let start = Instant::now();
+        let first = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+        for _ in 0..120 {
+            assert!(quota.allow_at(first, start));
+        }
+        assert!(!quota.allow_at(first, start));
+        for index in 2..=41 {
+            let source = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, index));
+            for _ in 0..120 {
+                assert!(quota.allow_at(source, start));
+            }
+        }
+        let last = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1));
+        for _ in 0..80 {
+            assert!(quota.allow_at(last, start));
+        }
+        assert!(!quota.allow_at(last, start));
+        assert!(quota.allow_at(first, start + Duration::from_secs(60)));
+    }
+
     #[tokio::test]
     async fn opaque_tls_reaches_fixed_upstream_and_reconnect_fences_old_generation() {
         let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
@@ -559,7 +615,7 @@ mod tests {
         let client_tls = Arc::new(client_tls);
         let gateway = Arc::new(Gateway {
             store: store.clone(),
-            gateway_id: "fixture-gateway".into(),
+            gateway_id: "fixture".into(),
             tunnels: Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
             streams: Arc::new(Semaphore::new(
@@ -700,13 +756,13 @@ mod tests {
         assert!(second_generation > first_generation);
         assert!(
             !store
-                .tunnel_is_current(id, "fixture-gateway", first_generation)
+                .tunnel_is_current(id, "fixture", first_generation)
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .tunnel_is_current(id, "fixture-gateway", second_generation)
+                .tunnel_is_current(id, "fixture", second_generation)
                 .await
                 .unwrap()
         );

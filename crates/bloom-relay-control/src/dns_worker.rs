@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 pub struct DnsWorker {
     store: Store,
+    placement: String,
     provider: Route53Provider,
     observer: HickoryObserver,
     ingress: Vec<IpAddr>,
@@ -13,6 +14,7 @@ pub struct DnsWorker {
 impl DnsWorker {
     pub async fn configured(
         store: Store,
+        placement: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let zone = env::var("BLOOM_RELAY_DNS_ZONE_ID")?;
         let ingress = addresses("BLOOM_RELAY_INGRESS_ADDRESSES")?;
@@ -20,6 +22,7 @@ impl DnsWorker {
         let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         Ok(Self {
             store,
+            placement,
             provider: Route53Provider::new(aws_sdk_route53::Client::new(&aws), zone)?,
             observer: HickoryObserver::new(authoritative)?,
             ingress,
@@ -28,7 +31,7 @@ impl DnsWorker {
 
     pub async fn run(self) {
         loop {
-            match self.store.claim_job().await {
+            match self.store.claim_job(&self.placement).await {
                 Ok(Some(job)) => {
                     let id = job.id;
                     match self.process(job).await {
@@ -54,14 +57,33 @@ impl DnsWorker {
         &self,
         job: OutboxJob,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Serialize provider writes with operator placement moves. The advisory
+        // lock has transaction lifetime, including DNS observation.
+        let mut lock = self.store.pool().begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(job.installation_id.to_string())
+            .execute(&mut *lock)
+            .await?;
+        let result = self.process_locked(job).await;
+        lock.commit().await?;
+        result
+    }
+
+    async fn process_locked(
+        &self,
+        job: OutboxJob,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let installation = job.installation_id;
         match job.kind.as_str() {
             "publish_name" => {
-                let Some((hostname, acme_account_uri)) =
+                let Some((hostname, acme_account_uri, placement)) =
                     self.store.dns_identity(installation).await?
                 else {
                     return Ok(true);
                 };
+                if placement != self.placement {
+                    return Ok(false);
+                }
                 let records = NameRecords {
                     hostname,
                     acme_account_uri,
@@ -84,9 +106,13 @@ impl DnsWorker {
                     return Ok(false);
                 };
                 let cleanup = job.kind == "remove_txt";
-                let Some((hostname, _)) = self.store.dns_identity(installation).await? else {
+                let Some((hostname, _, placement)) = self.store.dns_identity(installation).await?
+                else {
                     return Ok(true);
                 };
+                if placement != self.placement {
+                    return Ok(false);
+                }
                 let Some(lease) = self
                     .store
                     .challenge_for_job(installation, lease_id, cleanup)

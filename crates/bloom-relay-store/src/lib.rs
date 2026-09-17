@@ -132,8 +132,11 @@ impl Store {
         &self,
         installation_id: Uuid,
     ) -> Result<Option<[u8; 32]>, StoreError> {
-        let row = sqlx::query("SELECT admin_public_key FROM installations WHERE installation_id=$1 AND state != 'retired'")
-            .bind(installation_id).fetch_optional(&self.pool).await?;
+        let row =
+            sqlx::query("SELECT admin_public_key FROM installations WHERE installation_id=$1")
+                .bind(installation_id)
+                .fetch_optional(&self.pool)
+                .await?;
         row.map(|row| {
             let bytes: Vec<u8> = row.try_get("admin_public_key")?;
             bytes.try_into().map_err(|_| StoreError::InvalidRequest)
@@ -177,6 +180,15 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|row| row.get("hostname")))
+    }
+
+    pub async fn allocation_status(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<Option<Allocation>, StoreError> {
+        let row = sqlx::query("SELECT installation_id,hostname,placement,state FROM installations WHERE installation_id=$1")
+            .bind(installation_id).fetch_optional(&self.pool).await?;
+        row.map(|row| allocation_from_row(&row)).transpose()
     }
 
     pub async fn issue_bearer(
@@ -346,10 +358,16 @@ impl Store {
     pub async fn dns_identity(
         &self,
         installation_id: Uuid,
-    ) -> Result<Option<(String, String)>, StoreError> {
-        let row = sqlx::query("SELECT hostname, acme_account_uri FROM installations WHERE installation_id=$1 AND state!='retired' AND acme_account_uri IS NOT NULL")
+    ) -> Result<Option<(String, String, String)>, StoreError> {
+        let row = sqlx::query("SELECT hostname, acme_account_uri, placement FROM installations WHERE installation_id=$1 AND state!='retired' AND acme_account_uri IS NOT NULL")
             .bind(installation_id).fetch_optional(&self.pool).await?;
-        Ok(row.map(|row| (row.get("hostname"), row.get("acme_account_uri"))))
+        Ok(row.map(|row| {
+            (
+                row.get("hostname"),
+                row.get("acme_account_uri"),
+                row.get("placement"),
+            )
+        }))
     }
 
     pub async fn retired_hostname(
@@ -518,10 +536,10 @@ impl Store {
             .bind(installation_id).bind(lease_id).fetch_optional(&self.pool).await?.is_some())
     }
 
-    pub async fn claim_job(&self) -> Result<Option<OutboxJob>, StoreError> {
+    pub async fn claim_job(&self, placement: &str) -> Result<Option<OutboxJob>, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT id, installation_id, kind, payload FROM outbox WHERE completed_at IS NULL AND next_attempt_at<=now() ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1")
-            .fetch_optional(&mut *tx).await?;
+        let row = sqlx::query("SELECT o.id, o.installation_id, o.kind, o.payload FROM outbox o JOIN installations i USING (installation_id) WHERE i.placement=$1 AND o.completed_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
+            .bind(placement).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -619,8 +637,8 @@ impl Store {
             return Err(StoreError::InvalidRequest);
         }
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("UPDATE installations SET generation = generation + 1 WHERE installation_id = $1 AND state = 'dns_ready' RETURNING generation")
-            .bind(installation_id).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
+        let row = sqlx::query("UPDATE installations SET generation = generation + 1 WHERE installation_id = $1 AND state = 'dns_ready' AND placement=$2 RETURNING generation")
+            .bind(installation_id).bind(gateway_id).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
         let generation: i64 = row.try_get("generation")?;
         sqlx::query("INSERT INTO tunnel_leases(installation_id,generation,gateway_id,expires_at) VALUES ($1,$2,$3,now() + make_interval(secs => $4)) ON CONFLICT (installation_id) DO UPDATE SET generation = EXCLUDED.generation, gateway_id = EXCLUDED.gateway_id, expires_at = EXCLUDED.expires_at")
             .bind(installation_id).bind(generation).bind(gateway_id).bind(ttl_seconds).execute(&mut *tx).await?;
@@ -658,12 +676,98 @@ impl Store {
         Ok(changed == 1)
     }
 
+    pub async fn expire_pending_allocations(&self, limit: i64) -> Result<usize, StoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::InvalidRequest);
+        }
+        let rows = sqlx::query("SELECT installation_id FROM installations WHERE state='pending_dns' AND created_at<now()-interval '24 hours' ORDER BY created_at LIMIT $1")
+            .bind(limit).fetch_all(&self.pool).await?;
+        let mut expired = 0;
+        for row in rows {
+            let id: Uuid = row.get("installation_id");
+            let mut tx = self.pool.begin().await?;
+            // A DNS publish already in progress must finish before removal is
+            // queued; otherwise it could recreate records after cleanup.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            let changed = sqlx::query("UPDATE installations SET state='retired',retired_at=now(),generation=generation+1 WHERE installation_id=$1 AND state='pending_dns' AND created_at<now()-interval '24 hours'")
+                .bind(id).execute(&mut *tx).await?.rows_affected();
+            if changed == 0 {
+                continue;
+            }
+            sqlx::query("INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_records','{}'::jsonb)")
+                .bind(id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO security_audit(installation_id,event) VALUES ($1,'pending_allocation_expired')")
+                .bind(id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            self.acknowledge().await?;
+            expired += 1;
+        }
+        Ok(expired)
+    }
+
+    pub async fn expire_challenge_leases(&self, limit: i64) -> Result<usize, StoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::InvalidRequest);
+        }
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query("SELECT installation_id,lease_id FROM challenge_leases WHERE deleted_at IS NULL AND expires_at<=now() ORDER BY expires_at FOR UPDATE SKIP LOCKED LIMIT $1")
+            .bind(limit).fetch_all(&mut *tx).await?;
+        for row in &rows {
+            let id: Uuid = row.get("installation_id");
+            let lease_id: Uuid = row.get("lease_id");
+            sqlx::query("UPDATE challenge_leases SET deleted_at=now() WHERE installation_id=$1 AND lease_id=$2")
+                .bind(id).bind(lease_id).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_txt',$2)",
+            )
+            .bind(id)
+            .bind(serde_json::json!({"lease_id":lease_id}))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'challenge_expired')")
+                .bind(id).bind(lease_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        self.acknowledge().await?;
+        Ok(rows.len())
+    }
+
     pub async fn retire(
         &self,
         installation_id: Uuid,
         operation_id: Uuid,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(installation_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if let Some(existing) = sqlx::query(
+            "SELECT installation_id,kind FROM operations WHERE operation_id=$1 FOR UPDATE",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let owner: Uuid = existing.get("installation_id");
+            let kind: String = existing.get("kind");
+            if owner != installation_id || kind != "retire" {
+                return Err(StoreError::Conflict);
+            }
+            drop(tx);
+            self.acknowledge().await?;
+            return Ok(());
+        }
+        sqlx::query(
+            "SELECT installation_id FROM installations WHERE installation_id=$1 FOR UPDATE",
+        )
+        .bind(installation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::Conflict)?;
         let changed = sqlx::query("UPDATE installations SET state='retired', retired_at=now(), generation=generation+1 WHERE installation_id=$1 AND state != 'retired'")
             .bind(installation_id).execute(&mut *tx).await?.rows_affected();
         if changed > 0 {
@@ -676,10 +780,87 @@ impl Store {
             sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'retired')")
                 .bind(installation_id).bind(operation_id).execute(&mut *tx).await?;
         }
+        let mut hasher = Sha256::new();
+        hasher.update(b"bloom-relay/retire/v1\0");
+        hasher.update(installation_id.as_bytes());
+        let digest = hasher.finalize();
+        sqlx::query("INSERT INTO operations(operation_id,installation_id,kind,request_digest,result) VALUES ($1,$2,'retire',$3,'{}'::jsonb)")
+            .bind(operation_id).bind(installation_id).bind(digest.as_slice()).execute(&mut *tx).await?;
         tx.commit().await?;
         self.acknowledge().await?;
         Ok(())
     }
+
+    /// Operator-only move. The installation UUID and hostname remain stable;
+    /// the old gateway lease is fenced before the new placement publishes DNS.
+    pub async fn relocate(
+        &self,
+        installation_id: Uuid,
+        operation_id: Uuid,
+        placement: &str,
+    ) -> Result<(), StoreError> {
+        if placement.is_empty()
+            || placement.len() > 64
+            || !placement
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(StoreError::InvalidRequest);
+        }
+        let mut tx = self.pool.begin().await?;
+        // DNS workers hold this lock while applying and observing provider changes.
+        // A move cannot overtake an already claimed write from the old placement.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(installation_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if let Some(existing) = sqlx::query("SELECT installation_id,kind,request_digest FROM operations WHERE operation_id=$1 FOR UPDATE")
+            .bind(operation_id).fetch_optional(&mut *tx).await? {
+            let expected = relocation_digest(installation_id, placement);
+            if existing.get::<Uuid, _>("installation_id") != installation_id
+                || existing.get::<String, _>("kind") != "relocate"
+                || existing.get::<Vec<u8>, _>("request_digest") != expected {
+                return Err(StoreError::Conflict);
+            }
+            drop(tx);
+            self.acknowledge().await?;
+            return Ok(());
+        }
+        let row = sqlx::query("SELECT placement FROM installations WHERE installation_id=$1 AND state='dns_ready' FOR UPDATE")
+            .bind(installation_id).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
+        let current: String = row.get("placement");
+        if current == placement {
+            return Err(StoreError::Conflict);
+        }
+        sqlx::query("UPDATE installations SET placement=$2,generation=generation+1 WHERE installation_id=$1")
+            .bind(installation_id).bind(placement).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM tunnel_leases WHERE installation_id=$1")
+            .bind(installation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'publish_name',$2)",
+        )
+        .bind(installation_id)
+        .bind(serde_json::json!({"placement":placement}))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'placement_moved')")
+            .bind(installation_id).bind(operation_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO operations(operation_id,installation_id,kind,request_digest,result) VALUES ($1,$2,'relocate',$3,'{}'::jsonb)")
+            .bind(operation_id).bind(installation_id).bind(relocation_digest(installation_id, placement).as_slice()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        self.acknowledge().await?;
+        Ok(())
+    }
+}
+
+fn relocation_digest(id: Uuid, placement: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bloom-relay/relocate/v1\0");
+    hasher.update(id.as_bytes());
+    hasher.update(placement.as_bytes());
+    hasher.finalize().into()
 }
 
 fn allocation_from_row(row: &sqlx::postgres::PgRow) -> Result<Allocation, StoreError> {

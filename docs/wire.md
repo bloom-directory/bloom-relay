@@ -23,6 +23,13 @@ uses the assigned surface. The assigned label has 128 bits of OS randomness,
 base32 encoded as 26 lowercase characters. Hostnames are permanent even after
 retirement.
 
+Signed `POST /v1/installations/status` returns the current allocation state
+to its installation admin, including retired tombstones. Signed
+`POST /v1/installations/retire` permanently fences tunnel authority, enqueues
+exact DNS cleanup and retains the hostname reservation; repeating the same
+operation ID is safe. Pending allocations that never reach DNS readiness
+retire after 24 hours. Expired DNS-01 leases are deleted by a bounded sweep.
+
 The routine tunnel uses outbound TLS with HTTP/2 and a separately scoped
 random bearer credential in an owner-only file. A successful
 `POST /v1/tunnel` establishes the active installation lease. Each browser
@@ -45,10 +52,17 @@ request, then atomically replaces the active file after the receipt. No admin
 key is needed for routine renewal.
 
 The gateway uses rustls's ClientHello acceptor only to extract exact SNI.
+Before reading ClientHello it admits at most 120 new ingress connections per
+source IP and 5,000 globally per fixed 60-second window, with bounded state.
+This coarse source quota complements Broker's installation and recovery-ID
+quotas because the relay cannot inspect the inner HTTPS path.
 Every byte it reads is then forwarded unchanged. Browser TLS terminates at
 Broker. No tunnel frame can choose a local destination; the Broker client
 accepts only `127.0.0.1:18735`. A second tunnel for an installation advances
 the generation and fences old routing.
+The gateway ID must equal the stored placement. Operator relocation changes
+that placement transactionally, invalidates the old tunnel and queues DNS
+reconciliation without changing the hostname or RP ID.
 
 Current coded limits: 16 KiB control messages, 64 KiB ClientHello in five
 seconds, ten-second ticket/CONNECT setup, 128 streams per installation,

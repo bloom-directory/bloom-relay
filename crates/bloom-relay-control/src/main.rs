@@ -7,10 +7,10 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bloom_relay_protocol::{
-    AcmeAccountRequest, AllocateRequest, AllocationReceipt, BootstrapChallenge,
+    AcmeAccountRequest, AllocateRequest, Allocation, AllocationReceipt, BootstrapChallenge,
     CertificateMetadata, CredentialIssueReceipt, CredentialIssueRequest, CredentialRenewRequest,
-    DnsChallengeDeleteRequest, DnsChallengeRequest, ErrorCode, ErrorEnvelope, Scope, SignedRequest,
-    WIRE_VERSION, sha256_hex,
+    DnsChallengeDeleteRequest, DnsChallengeRequest, ErrorCode, ErrorEnvelope,
+    InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex,
 };
 use bloom_relay_store::{RestoreWitness, Store};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -107,8 +107,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     });
-    let worker = dns_worker::DnsWorker::configured(state.store.clone()).await?;
+    let worker =
+        dns_worker::DnsWorker::configured(state.store.clone(), state.placement.clone()).await?;
     tokio::spawn(worker.run());
+    let sweeper_store = state.store.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = sweeper_store.expire_pending_allocations(100).await {
+                tracing::warn!(%error, "pending allocation sweep failed");
+            }
+            if let Err(error) = sweeper_store.expire_challenge_leases(100).await {
+                tracing::warn!(%error, "challenge lease sweep failed");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
     let app = Router::new()
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(ready))
@@ -117,6 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/v1/credentials", post(issue_credential))
         .route("/v1/credentials/renew", post(renew_credential))
         .route("/v1/acme-account", post(register_acme_account))
+        .route("/v1/installations/status", post(installation_status))
+        .route("/v1/installations/retire", post(retire_installation))
         .route("/v1/certificates", post(record_certificate))
         .route("/v1/dns/challenge", post(create_dns_challenge))
         .route("/v1/dns/challenge/delete", post(delete_dns_challenge))
@@ -158,6 +173,85 @@ async fn authenticate_dns(
         return Err(unauthorized());
     }
     Ok(observed)
+}
+
+async fn authorize_admin<T: serde::Serialize>(
+    state: &AppState,
+    request: &SignedRequest<T>,
+) -> Result<(), ApiError> {
+    let installation_id = request.claims.installation_id;
+    let Some(bytes) = state
+        .store
+        .admin_public_key(installation_id)
+        .await
+        .map_err(|_| unavailable())?
+    else {
+        return Err(unauthorized());
+    };
+    let key = VerifyingKey::from_bytes(&bytes).map_err(|_| unavailable())?;
+    let body = serde_jcs::to_vec(&request.body).map_err(|_| invalid())?;
+    request
+        .claims
+        .verify(
+            &body,
+            &request.signature,
+            &key,
+            Scope::SurfaceAdmin,
+            &state.audience,
+            now_ms(),
+        )
+        .map_err(|_| unauthorized())?;
+    if !state
+        .store
+        .consume_nonce(installation_id, &request.claims.nonce)
+        .await
+        .map_err(|_| unavailable())?
+    {
+        return Err(ApiError(
+            StatusCode::GONE,
+            ErrorCode::ExpiredOrReplayed,
+            false,
+        ));
+    }
+    Ok(())
+}
+
+async fn installation_status(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SignedRequest<InstallationStatusRequest>>,
+) -> Result<Json<Allocation>, ApiError> {
+    if request.body.installation_id != request.claims.installation_id {
+        return Err(unauthorized());
+    }
+    authorize_admin(&state, &request).await?;
+    let allocation = state
+        .store
+        .allocation_status(request.body.installation_id)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(unauthorized)?;
+    Ok(Json(allocation))
+}
+
+async fn retire_installation(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SignedRequest<RetireRequest>>,
+) -> Result<StatusCode, ApiError> {
+    if request.body.installation_id != request.claims.installation_id {
+        return Err(unauthorized());
+    }
+    authorize_admin(&state, &request).await?;
+    state
+        .store
+        .retire(request.body.installation_id, request.claims.operation_id)
+        .await
+        .map_err(|error| match error {
+            bloom_relay_store::StoreError::Conflict => {
+                ApiError(StatusCode::CONFLICT, ErrorCode::Conflict, false)
+            }
+            _ => unavailable(),
+        })?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn register_acme_account(
@@ -559,4 +653,165 @@ async fn issue_credential(
         operation_id: request.claims.operation_id,
         expires_at_ms,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    fn signed<T: serde::Serialize>(
+        installation_id: Uuid,
+        operation_id: Uuid,
+        body: T,
+        key: &SigningKey,
+    ) -> SignedRequest<T> {
+        let canonical = serde_jcs::to_vec(&body).unwrap();
+        let claims = bloom_relay_protocol::AuthClaims {
+            version: WIRE_VERSION,
+            installation_id,
+            scope: Scope::SurfaceAdmin,
+            generation: 0,
+            audience: "relay-control.bloom.directory".into(),
+            operation_id,
+            nonce: Uuid::new_v4().to_string(),
+            expires_at_ms: now_ms() + 30_000,
+            body_sha256: sha256_hex(&canonical),
+        };
+        let signature =
+            URL_SAFE_NO_PAD.encode(key.sign(&claims.signing_bytes().unwrap()).to_bytes());
+        SignedRequest {
+            claims,
+            body,
+            signature,
+        }
+    }
+
+    async fn send<T: serde::Serialize>(
+        app: Router,
+        path: &str,
+        request: SignedRequest<T>,
+    ) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_status_and_retirement_require_bound_signature_and_retry_safely() {
+        let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        let key = SigningKey::from_bytes(&[17u8; 32]);
+        let allocation = store
+            .allocate(Uuid::new_v4(), key.verifying_key().to_bytes(), "fixture")
+            .await
+            .unwrap();
+        let id = allocation.installation_id;
+        let state = Arc::new(AppState {
+            store: store.clone(),
+            receipt_key: key.clone(),
+            audience: "relay-control.bloom.directory".into(),
+            placement: "fixture".into(),
+        });
+        let app = Router::new()
+            .route("/v1/installations/status", post(installation_status))
+            .route("/v1/installations/retire", post(retire_installation))
+            .with_state(state);
+        let wrong = signed(
+            id,
+            Uuid::new_v4(),
+            InstallationStatusRequest {
+                installation_id: Uuid::new_v4(),
+            },
+            &key,
+        );
+        assert_eq!(
+            send(app.clone(), "/v1/installations/status", wrong)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let status = signed(
+            id,
+            Uuid::new_v4(),
+            InstallationStatusRequest {
+                installation_id: id,
+            },
+            &key,
+        );
+        let response = send(app.clone(), "/v1/installations/status", status).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed: Allocation =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(observed.hostname, allocation.hostname);
+        let retirement = Uuid::new_v4();
+        assert_eq!(
+            send(
+                app.clone(),
+                "/v1/installations/retire",
+                signed(
+                    id,
+                    retirement,
+                    RetireRequest {
+                        installation_id: id
+                    },
+                    &key
+                )
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            send(
+                app.clone(),
+                "/v1/installations/retire",
+                signed(
+                    id,
+                    retirement,
+                    RetireRequest {
+                        installation_id: id
+                    },
+                    &key
+                )
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        let response = send(
+            app,
+            "/v1/installations/status",
+            signed(
+                id,
+                Uuid::new_v4(),
+                InstallationStatusRequest {
+                    installation_id: id,
+                },
+                &key,
+            ),
+        )
+        .await;
+        let observed: Allocation =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap())
+                .unwrap();
+        assert!(matches!(
+            observed.state,
+            bloom_relay_protocol::AllocationState::Retired
+        ));
+    }
 }

@@ -12,6 +12,7 @@ bloom-relay-dns = { path = "../bloom-relay-dns" }
 tokio.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -26,3 +27,6 @@ serde_jcs.workspace = true
 rustls.workspace = true
 aws-config.workspace = true
 aws-sdk-route53.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

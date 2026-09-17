@@ -250,6 +250,18 @@ pub struct AcmeAccountRequest {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct InstallationStatusRequest {
+    pub installation_id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetireRequest {
+    pub installation_id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsChallengeRequest {
     pub version: u16,
     pub installation_id: Uuid,

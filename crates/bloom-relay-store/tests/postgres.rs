@@ -64,17 +64,21 @@ async fn allocation_rotation_dns_and_fencing() {
             .unwrap(),
         None
     );
-    let first = store.claim_tunnel(id, "gateway-a", 45).await.unwrap();
-    let second = store.claim_tunnel(id, "gateway-b", 45).await.unwrap();
+    assert!(matches!(
+        store.claim_tunnel(id, "wrong-placement", 45).await,
+        Err(StoreError::Conflict)
+    ));
+    let first = store.claim_tunnel(id, "test-shard", 45).await.unwrap();
+    let second = store.claim_tunnel(id, "test-shard", 45).await.unwrap();
     assert!(
         !store
-            .tunnel_is_current(id, "gateway-a", first)
+            .tunnel_is_current(id, "test-shard", first)
             .await
             .unwrap()
     );
     assert!(
         store
-            .tunnel_is_current(id, "gateway-b", second)
+            .tunnel_is_current(id, "test-shard", second)
             .await
             .unwrap()
     );
@@ -123,7 +127,7 @@ async fn allocation_rotation_dns_and_fencing() {
     );
     assert!(
         !store
-            .tunnel_is_current(id, "gateway-b", second)
+            .tunnel_is_current(id, "test-shard", second)
             .await
             .unwrap()
     );
@@ -152,7 +156,17 @@ async fn allocation_rotation_dns_and_fencing() {
         .await
         .unwrap();
     assert!(!store.challenge_ready(id, lease_id).await.unwrap());
-    store.retire(id, Uuid::new_v4()).await.unwrap();
+    let retire_operation = Uuid::new_v4();
+    store.retire(id, retire_operation).await.unwrap();
+    store.retire(id, retire_operation).await.unwrap();
+    assert!(matches!(
+        store.retire(id, issue).await,
+        Err(StoreError::Conflict)
+    ));
+    assert!(matches!(
+        store.allocation_status(id).await.unwrap().unwrap().state,
+        bloom_relay_protocol::AllocationState::Retired
+    ));
     assert_eq!(store.hostname(id).await.unwrap(), None);
     assert_eq!(
         store
@@ -170,11 +184,146 @@ async fn allocation_rotation_dns_and_fencing() {
     assert_eq!(reserved, 1);
 }
 
+#[tokio::test]
+async fn abandoned_pending_and_challenge_leases_are_swept_without_reuse() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+    let pending = store
+        .allocate(Uuid::new_v4(), [6u8; 32], "test-shard")
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE installations SET created_at=now()-interval '25 hours' WHERE installation_id=$1",
+    )
+    .bind(pending.installation_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(store.expire_pending_allocations(100).await.unwrap() >= 1);
+    assert!(matches!(
+        store
+            .allocation_status(pending.installation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        bloom_relay_protocol::AllocationState::Retired
+    ));
+    let reservation: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM hostname_reservations WHERE hostname=$1")
+            .bind(&pending.hostname)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(reservation, 1);
+
+    let allocation = store
+        .allocate(Uuid::new_v4(), [7u8; 32], "test-shard")
+        .await
+        .unwrap();
+    let id = allocation.installation_id;
+    store
+        .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+        .await
+        .unwrap();
+    store.mark_dns_ready(id).await.unwrap();
+    let token_hash: [u8; 32] = Sha256::digest(b"d-credential").into();
+    let (generation, _) = store
+        .issue_bearer(id, Uuid::new_v4(), "dns_challenge", token_hash, 3600)
+        .await
+        .unwrap();
+    let lease_id = Uuid::new_v4();
+    store
+        .create_challenge(
+            id,
+            generation,
+            &ChallengeLease {
+                operation_id: lease_id,
+                txt_value: "z".repeat(43),
+                expires_at_ms: now_ms() + 60_000,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE challenge_leases SET expires_at=now()-interval '1 second' WHERE installation_id=$1 AND lease_id=$2")
+        .bind(id).bind(lease_id).execute(store.pool()).await.unwrap();
+    assert!(store.expire_challenge_leases(100).await.unwrap() >= 1);
+    assert!(!store.challenge_ready(id, lease_id).await.unwrap());
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE installation_id=$1 AND kind='remove_txt'",
+    )
+    .bind(id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(jobs, 1);
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[tokio::test]
+async fn placement_move_fences_gateway_and_routes_dns_work() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+    let first_placement = format!("first-{}", Uuid::new_v4().simple());
+    let second_placement = format!("second-{}", Uuid::new_v4().simple());
+    let allocation = store
+        .allocate(Uuid::new_v4(), [3u8; 32], &first_placement)
+        .await
+        .unwrap();
+    let id = allocation.installation_id;
+    assert!(store.claim_job(&second_placement).await.unwrap().is_none());
+    let first_job = store.claim_job(&first_placement).await.unwrap().unwrap();
+    assert_eq!(first_job.installation_id, id);
+    store.complete_job(first_job.id).await.unwrap();
+    store
+        .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+        .await
+        .unwrap();
+    store.mark_dns_ready(id).await.unwrap();
+    let first_generation = store.claim_tunnel(id, &first_placement, 45).await.unwrap();
+    let move_operation = Uuid::new_v4();
+    store
+        .relocate(id, move_operation, &second_placement)
+        .await
+        .unwrap();
+    store
+        .relocate(id, move_operation, &second_placement)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.relocate(id, move_operation, &first_placement).await,
+        Err(StoreError::Conflict)
+    ));
+    assert!(
+        !store
+            .tunnel_is_current(id, &first_placement, first_generation)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        store.claim_tunnel(id, &first_placement, 45).await,
+        Err(StoreError::Conflict)
+    ));
+    let second_generation = store.claim_tunnel(id, &second_placement, 45).await.unwrap();
+    assert!(second_generation > first_generation);
+    assert!(store.claim_job(&first_placement).await.unwrap().is_none());
+    let job = store.claim_job(&second_placement).await.unwrap().unwrap();
+    assert_eq!(job.installation_id, id);
+    assert_eq!(job.kind, "publish_name");
+    assert_eq!(
+        store.allocation_status(id).await.unwrap().unwrap().hostname,
+        allocation.hostname
+    );
 }
 
 #[tokio::test]

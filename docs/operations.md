@@ -16,6 +16,9 @@ The control service takes its PostgreSQL URL, bind address, placement, TLS
 certificate/key paths and raw 32-byte receipt-signing key path from
 restricted service configuration. The gateway takes PostgreSQL URL,
 gateway ID, control bind, public ingress bind and control TLS key paths.
+The gateway ID must exactly equal its shard placement. A tunnel claim at a
+different placement is rejected even with a valid scoped credential. Each DNS
+worker claims only jobs for its configured placement.
 Control also requires the delegated Route 53 hosted zone ID, comma-separated
 ingress addresses and authoritative DNS server addresses. Its DNS worker uses
 the standard AWS workload credential chain; give that role permission only
@@ -32,8 +35,14 @@ the operator reconciles the durable operation before retry. Production
 recovery still needs independently retained audit/backup evidence and a
 documented restore rehearsal.
 Do not pass bearer values on command lines or environment variables. Broker
-reads its tunnel credential from an owner-only file. Control metrics and
-administrative endpoints belong on a private network.
+reads its tunnel credential from an owner-only file. The signed control API
+uses its fixed public TLS origin; metrics and backend management belong on a
+private network.
+Bootstrap challenge issuance is capped at 10 per source IP and 100 globally
+per minute; pending allocations expire after 24 hours. Browser ingress
+admits at most 120 new TLS connections per source IP and 5,000 globally per
+fixed minute. Tune these values from capacity/NAT measurements before public
+opening while retaining Broker's installation and recovery-ID quotas.
 
 Deployment acceptance must exercise authoritative and recursive
 A/AAAA/CAA/TXT resolution, unknown-name NXDOMAIN, IPv4/IPv6 ingress,
@@ -44,6 +53,19 @@ private key, validates the exact hostname, stages a replacement certificate,
 and reloads atomically. A failed renewal keeps a still-valid lineage only;
 expiry disables remote access. Run staging issuance and renewal with
 disposable names before enabling the production CA.
+
+To move a live installation, provision the new gateway and its ingress
+addresses first. Run `bloom-relay-relocate INSTALLATION_UUID OPERATION_UUID
+PLACEMENT` from the restricted operator environment with
+`BLOOM_RELAY_DATABASE_URL` and `BLOOM_RELAY_RESTORE_WITNESS_PATH`. Reuse the
+same operation UUID on an ambiguous retry. The transaction preserves the
+hostname, fences the old tunnel, changes placement and queues a new exact DNS
+publish. DNS writes already in progress finish under a per-installation
+database advisory lock before the move commits. The new placement worker
+publishes A/AAAA and observes authoritative and recursive answers; only then
+should operators consider the move complete. Wait for the previous DNS TTL,
+verify new ingress and reconnect, and record the observed propagation. Do not
+run two public gateway processes with the same placement as an HA strategy.
 
 Backups must preserve `hostname_reservations` and security audit high-water
 marks beyond the database snapshot. Restoring a stale snapshot must be

@@ -2,8 +2,9 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bloom_relay_protocol::{
-    AcmeAccountRequest, AllocateRequest, AllocationReceipt, AuthClaims, BootstrapChallenge,
-    CredentialIssueReceipt, CredentialIssueRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex,
+    AcmeAccountRequest, AllocateRequest, Allocation, AllocationReceipt, AuthClaims,
+    BootstrapChallenge, CredentialIssueReceipt, CredentialIssueRequest, InstallationStatusRequest,
+    RetireRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex, validate_hostname,
 };
 use rand::{RngCore, rngs::OsRng};
 use std::{
@@ -238,6 +239,97 @@ where
         return Err(EnrollmentError::Rejected);
     }
     Ok(())
+}
+
+pub fn installation_status<F>(
+    config: EnrollmentConfig,
+    installation_id: Uuid,
+    operation_id: Uuid,
+    sign: F,
+) -> Result<Allocation, EnrollmentError>
+where
+    F: Fn(&[u8]) -> Result<[u8; 64], EnrollmentError>,
+{
+    let response = signed_admin_call(
+        config,
+        installation_id,
+        operation_id,
+        InstallationStatusRequest { installation_id },
+        "/v1/installations/status",
+        sign,
+    )?;
+    let allocation: Allocation = read_bounded_json(response)?;
+    if allocation.version != WIRE_VERSION
+        || allocation.installation_id != installation_id
+        || validate_hostname(&allocation.hostname).is_err()
+    {
+        return Err(EnrollmentError::InvalidReceipt);
+    }
+    Ok(allocation)
+}
+
+pub fn retire_installation<F>(
+    config: EnrollmentConfig,
+    installation_id: Uuid,
+    operation_id: Uuid,
+    sign: F,
+) -> Result<(), EnrollmentError>
+where
+    F: Fn(&[u8]) -> Result<[u8; 64], EnrollmentError>,
+{
+    let response = signed_admin_call(
+        config,
+        installation_id,
+        operation_id,
+        RetireRequest { installation_id },
+        "/v1/installations/retire",
+        sign,
+    )?;
+    if response.status() != 202 {
+        return Err(EnrollmentError::Rejected);
+    }
+    Ok(())
+}
+
+fn signed_admin_call<T, F>(
+    config: EnrollmentConfig,
+    installation_id: Uuid,
+    operation_id: Uuid,
+    body: T,
+    path: &str,
+    sign: F,
+) -> Result<ureq::http::Response<ureq::Body>, EnrollmentError>
+where
+    T: serde::Serialize,
+    F: Fn(&[u8]) -> Result<[u8; 64], EnrollmentError>,
+{
+    let agent = build_agent(&config)?;
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let claims = AuthClaims {
+        version: WIRE_VERSION,
+        installation_id,
+        scope: Scope::SurfaceAdmin,
+        generation: 0,
+        audience: CONTROL_AUDIENCE.into(),
+        operation_id,
+        nonce: URL_SAFE_NO_PAD.encode(nonce),
+        expires_at_ms: now_ms() + 30_000,
+        body_sha256: sha256_hex(&serde_jcs::to_vec(&body).map_err(|_| EnrollmentError::Rejected)?),
+    };
+    let signature = URL_SAFE_NO_PAD.encode(sign(
+        &claims
+            .signing_bytes()
+            .map_err(|_| EnrollmentError::Rejected)?,
+    )?);
+    agent
+        .post(format!("{CONTROL_ORIGIN}{path}"))
+        .send_json(SignedRequest {
+            claims,
+            body,
+            signature,
+        })
+        .map_err(|_| EnrollmentError::Unavailable)
 }
 
 fn build_agent(config: &EnrollmentConfig) -> Result<ureq::Agent, EnrollmentError> {
