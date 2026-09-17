@@ -41,7 +41,7 @@ exception. These are selected libraries, not a claim of an already tested graph:
 | Persistence | [sqlx](https://docs.rs/sqlx/latest/sqlx/) 0.9.0 with PostgreSQL, Tokio and rustls features; versioned SQL migrations |
 | Diagnostics | tracing, [tracing-subscriber](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/) 0.3.23; JSON production logs, EnvFilter |
 | Errors | [thiserror](https://docs.rs/thiserror/latest/thiserror/) 2.0.20 for typed library errors; anyhow only at executable boundaries |
-| DNS provider | [aws-sdk-route53](https://docs.rs/aws-sdk-route53/latest/aws_sdk_route53/) and aws-config for the proposed first adapter |
+| DNS provider | [aws-sdk-route53](https://docs.rs/aws-sdk-route53/latest/aws_sdk_route53/) and aws-config for Route 53; reqwest with rustls for Cloudflare DNS API |
 | Supporting APIs | serde/serde_json, clap, validated TOML configuration, [reqwest](https://docs.rs/reqwest/latest/reqwest/) with rustls for bounded HTTP calls |
 | Metrics and tests | metrics + Prometheus exporter; proptest, cargo-fuzz, testcontainers or a disposable PostgreSQL fixture |
 
@@ -84,7 +84,7 @@ crates/
   bloom-relay/            ingress + tunnel gateway executable
   bloom-relay-control/    enrollment API + reconciliation workers executable
   bloom-relay-store/      SQL transactions, migrations, outbox and audit records
-  bloom-relay-dns/        narrow DNS interface, Route 53 + deterministic test adapter
+  bloom-relay-dns/        narrow DNS interface, Route 53, Cloudflare and test adapters
 migrations/              forward schema changes and restore/version checks
 tests/                   protocol, routing, DNS and fault-injection integration
 infra/                   reviewed DNS, network, identity, DB and service definitions
@@ -99,12 +99,15 @@ host/port, command, filesystem path, Machine RPC or Signer destination.
 
 ## DNS and public ingress
 
-Proposed first production provider: **Route 53** for a separately delegated
-`relay.bloom.directory` public hosted zone. Parent-zone NS delegation, optional
-DNSSEC/DS rollout, infrastructure account/region, and actual ingress addresses
-must be recorded in an operations decision before production; they are not
-application-controlled or assumed to exist. Provider choice may change behind
-the narrow adapter without changing installation identity or protocol.
+Route 53 and Cloudflare are supported behind the narrow DNS adapter. The intended
+rollout uses Cloudflare's existing authoritative `bloom.directory` zone while
+assigned names remain under `relay.bloom.directory`. Route 53 remains available
+for a separately delegated relay zone. Record provider ownership, zone ID,
+nameservers, optional DNSSEC/DS decision and ingress addresses before production;
+they are not application-controlled or assumed to be deployed. Provider choice
+does not change installation identity or protocol. Cloudflare zone-level API
+tokens cannot restrict individual record names or types as Route 53 IAM can;
+the serving and challenge worker scope boundaries are application-enforced.
 
 Use **explicit per-installation A/AAAA records**, not a wildcard, pointing to the
 assigned relay ingress shard's stable addresses. Publish AAAA only when IPv6 is
@@ -191,9 +194,11 @@ value; delayed cleanup cannot remove a newer concurrent challenge. Authenticate
 scope on both creation and deletion and audit lifecycle events without TXT values.
 Check propagation before reporting ready. Sweep abandoned leases idempotently.
 
-The DNS worker alone holds a provider identity restricted to this hosted zone,
-record types and permitted operations; further enforce exact ownership in code.
-Admin CAA/address reconciliation and routine TXT hooks have separate IAM roles.
+The DNS worker alone holds a provider identity restricted to the selected zone;
+further enforce exact ownership and record-type boundaries in code. Route 53
+roles can additionally restrict record names, types and operations through IAM.
+Cloudflare zone-level tokens cannot provide those per-record/type limits.
+Admin CAA/address reconciliation and routine TXT hooks use separate identities.
 No hook can mutate CAA, siblings, parent zones, wildcards, MX or arbitrary records.
 
 Publish exact CAA authorizing Let's Encrypt, DNS-01 and the enrolled ACME account
@@ -304,7 +309,7 @@ Implementation slices:
 1. Workspace/toolchain/dependency lock, config validation, tracing/errors, protocol
    types and CI; architecture/wire-format decisions and resource-limit fixtures.
 2. PostgreSQL schema, idempotent allocation/tombstones and outbox; test DNS adapter.
-3. Admin enrollment/scoped credential issuance and Route 53 reconciliation;
+3. Admin enrollment/scoped credential issuance and DNS reconciliation;
    authoritative/recursive A/AAAA/CAA/TXT tests and staging issuance.
 4. Gateway ClientHello parser, leases, HTTP/2 control/CONNECT streams and Broker
    client; adversarial routing and resource tests before public ingress.

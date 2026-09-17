@@ -26,9 +26,9 @@ Apply `packaging/postgres/runtime-grants.sql.example` as the schema owner
 after selecting the production database name. Test each role's allowed and
 denied operations under `SET ROLE` during staging acceptance. PostgreSQL peer
 authentication and its Unix socket must map each service UID to its DB role;
-the example URLs contain no DB password. The API has no AWS credential. Only
-the serving and challenge workers receive distinct AWS credentials through
-systemd `LoadCredential`; neither worker receives the receipt-signing key.
+the example URLs contain no DB password. The API has no DNS provider credential.
+Only the serving and challenge workers receive distinct provider credentials
+through systemd `LoadCredential`; neither worker receives the receipt-signing key.
 
 Create `/var/lib/bloom-relay/witness` on storage outside PostgreSQL snapshot
 restores, owned by root and group `bloom-relay-witness`, mode `2770`.
@@ -59,6 +59,27 @@ Route 53's record-name, type, action and hosted-zone conditions. Replace the
 zone ID and validate both allowed and denied calls with the real identity.
 The worker's typed outbox scope and provider methods add an exact assigned
 hostname check. The API and gateway must have no Route 53 permission.
+
+For Cloudflare, use the `*.cloudflare.env.example` files and the corresponding
+drop-ins under `packaging/systemd/cloudflare/`. Install each drop-in as
+`/etc/systemd/system/<unit>.service.d/cloudflare.conf`, copy its example env
+file to the path named in the drop-in, then run `systemctl daemon-reload`.
+The drop-ins replace the AWS credential and environment settings. They pass
+only the path `%d/cloudflare` to the worker; systemd copies each token from a
+separate root-owned, mode `0600` source file via `LoadCredential`. Never put a
+token in an env file, command argument or unit `Environment=` value. Set
+`BLOOM_RELAY_DNS_PROVIDER=cloudflare` and the Cloudflare **zone ID**, not a
+Route 53 hosted-zone ID. Keep the Route 53 units and env files when using
+`route53` (the default if the selector is omitted).
+
+Create two Cloudflare API tokens restricted to the selected DNS zone with DNS
+read/edit permissions, one per worker. Cloudflare's zone-level token permissions
+cannot enforce Route 53-style per-record-name or record-type IAM. The serving
+worker's A/AAAA/CAA boundary and the challenge worker's TXT boundary are
+enforced in the application and outbox, not by Cloudflare's token policy. Treat
+compromise of either token as authority to edit other records in that zone;
+restrict token access, audit changes and rotate it on suspicion. The API and
+gateway receive neither token.
 
 Each service has separate loopback HTTP health (`/health/live`,
 `/health/ready`) and Prometheus listeners. Public control routes expose

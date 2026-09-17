@@ -6,12 +6,12 @@ The reviewable Linux release templates and role grants are in
 [`package.md`](package.md); their installation and live drills are still
 deployment actions.
 
-Before a production rollout, record the owning AWS account, Route 53 hosted
-zone ID and parent-zone NS delegation, optional DNSSEC/DS decision, ingress
-IPv4 and IPv6 addresses, shard placement, PostgreSQL service and backup
-owner, and separate workload identities for gateway, control administration
-and DNS reconciliation. The gateway must have no Route 53 permission; the
-DNS role must be restricted to the delegated zone and exact record types.
+Before a production rollout, record the DNS provider and its owning account,
+zone ID and delegation or authoritative-zone decision, optional DNSSEC/DS
+decision, ingress IPv4 and IPv6 addresses, shard placement, PostgreSQL service
+and backup owner, and separate workload identities for gateway, control administration
+and DNS reconciliation. The gateway must have no DNS provider permission.
+For Route 53, restrict DNS roles to the delegated zone and exact record types.
 The `relay-control.bloom.directory` TLS identity and offline receipt-signing
 key need separate protected provisioning and rotation procedures.
 
@@ -22,11 +22,15 @@ gateway ID, control bind, public ingress bind and control TLS key paths.
 The gateway ID must exactly equal its shard placement. A tunnel claim at a
 different placement is rejected even with a valid scoped credential. Each DNS
 worker claims only jobs for its configured placement.
-Separate `dns-serving` and `dns-challenge` workers take the delegated Route 53
-hosted zone ID, comma-separated ingress addresses and authoritative DNS server
-addresses. Give the first role only A/AAAA/CAA changes and the second only
-TXT changes under `_acme-challenge`, with distinct AWS credentials; the API
-process has no AWS credential. All services require
+Separate `dns-serving` and `dns-challenge` workers take the provider zone ID,
+comma-separated ingress addresses and authoritative DNS server addresses.
+Set `BLOOM_RELAY_DNS_PROVIDER` explicitly in deployment configuration. Route 53
+remains the default for older configurations. Give its serving role only
+A/AAAA/CAA changes and its challenge role only TXT changes under
+`_acme-challenge`, with distinct AWS credentials. For Cloudflare, use distinct
+zone-scoped API tokens delivered as protected files via systemd `LoadCredential`
+as described in [`package.md`](package.md). The API process has no DNS provider
+credential. All services require
 `BLOOM_RELAY_RESTORE_WITNESS_PATH`, a restricted shared-group high-water file on
 storage independent of PostgreSQL snapshots. Preserve the shared witness
 across database restore. The store takes an advisory lock and advances the
@@ -48,9 +52,28 @@ admits at most 120 new TLS connections per source IP and 5,000 globally per
 fixed minute. Tune these values from capacity/NAT measurements before public
 opening while retaining Broker's installation and recovery-ID quotas.
 
+For the intended Cloudflare rollout, use the authoritative `bloom.directory`
+zone and record its zone ID and nameservers in the restricted operations
+inventory. The relay's assigned names remain under `relay.bloom.directory`;
+use exact, DNS-only A/AAAA/CAA records and exact `_acme-challenge` TXT records.
+Use the Cloudflare zone ID in both worker env files, the public ingress address
+in `BLOOM_RELAY_INGRESS_ADDRESSES`, and the zone's authoritative DNS server
+addresses in `BLOOM_RELAY_AUTHORITATIVE_ADDRESSES`. Keep the control service
+address and the ingress address distinct in the router and gateway config.
+Cloudflare tokens cannot enforce per-record-name/type restrictions within a
+zone; only worker scope, provider validation and outbox ownership checks enforce
+that boundary. Review zone audit activity and keep the two tokens isolated.
+Before accepting allocations, a separate zone operator must add CAA
+`0 issue ";"` and `0 issuewild ";"` at `relay.bloom.directory`, preserving
+all unrelated records there. This denies issuance for unallocated or retired
+relay names that have no exact per-installation CAA. Do not put this policy at
+`bloom.directory` or `relay-control.bloom.directory`; the DNS workers have no
+authority to modify the parent policy. Confirm authoritative and recursive CAA
+answers before enrollment and after a retirement.
+
 Deployment acceptance must exercise authoritative and recursive
 A/AAAA/CAA/TXT resolution, unknown-name NXDOMAIN, IPv4/IPv6 ingress,
-placement move with stable RP, and Route 53 change timeout/ambiguous-write
+placement move with stable RP, and provider change timeout/ambiguous-write
 reconciliation. Register the ACME account URI before restrictive CAA
 publication. Broker performs DNS-01 with its own account/key and certificate
 private key, validates the exact hostname, stages a replacement certificate,
@@ -102,7 +125,7 @@ The local test gate uses disposable PostgreSQL 14 and loopback-only TLS. Run
 to exercise opaque Browser TLS forwarding, tunnel reconnect fencing, scoped
 credential rotation, DNS challenge leases, stale restore refusal and the CT
 alert fixture. CI provisions the disposable database. The remaining rollout
-work is CT source/adapter and alert destination configuration, real Route 53 propagation and failure
-drills, public ACME staging issuance/renewal, reviewed service installation,
-load and incident drills, and the recorded ownership/configuration above.
+work is CT source/adapter and alert destination configuration, real provider
+propagation and failure drills, public ACME staging issuance/renewal, reviewed
+service installation, load and incident drills, and the recorded ownership/configuration above.
 A health endpoint or local fixture alone is not production readiness evidence.

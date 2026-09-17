@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 
 mod route53;
 pub use route53::Route53Provider;
+mod cloudflare;
+pub use cloudflare::{CloudflareProvider, CloudflareScope};
 mod observer;
 pub use observer::HickoryObserver;
 

@@ -1,13 +1,16 @@
-use bloom_relay_dns::{HickoryObserver, NameRecords, Provider, Route53Provider, TxtLease};
+use bloom_relay_dns::{
+    CloudflareProvider, CloudflareScope, DnsError, HickoryObserver, NameRecords, Provider,
+    Route53Provider, TxtLease,
+};
 use bloom_relay_store::{DnsJobScope, OutboxJob, Store};
-use std::{env, net::IpAddr, time::Duration};
+use std::{env, io::Read, net::IpAddr, time::Duration};
 use uuid::Uuid;
 
 pub struct DnsWorker {
     store: Store,
     placement: String,
     scope: DnsJobScope,
-    provider: Route53Provider,
+    provider: DnsProvider,
     observer: HickoryObserver,
     ingress: Vec<IpAddr>,
 }
@@ -21,12 +24,34 @@ impl DnsWorker {
         let zone = env::var("BLOOM_RELAY_DNS_ZONE_ID")?;
         let ingress = addresses("BLOOM_RELAY_INGRESS_ADDRESSES")?;
         let authoritative = addresses("BLOOM_RELAY_AUTHORITATIVE_ADDRESSES")?;
-        let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let provider_name = match env::var("BLOOM_RELAY_DNS_PROVIDER") {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => "route53".to_owned(),
+            Err(env::VarError::NotUnicode(_)) => return Err("invalid DNS provider selector".into()),
+        };
+        let provider = match ProviderKind::parse(&provider_name)? {
+            ProviderKind::Cloudflare => {
+                let token_path = env::var("BLOOM_RELAY_CLOUDFLARE_TOKEN_FILE")?;
+                let token = cloudflare_token(&token_path)?;
+                let scope = match scope {
+                    DnsJobScope::Serving => CloudflareScope::Serving,
+                    DnsJobScope::Challenge => CloudflareScope::Challenge,
+                };
+                DnsProvider::Cloudflare(CloudflareProvider::new(zone, token, scope)?)
+            }
+            ProviderKind::Route53 => {
+                let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                DnsProvider::Route53(Route53Provider::new(
+                    aws_sdk_route53::Client::new(&aws),
+                    zone,
+                )?)
+            }
+        };
         Ok(Self {
             store,
             placement,
             scope,
-            provider: Route53Provider::new(aws_sdk_route53::Client::new(&aws), zone)?,
+            provider,
             observer: HickoryObserver::new(authoritative)?,
             ingress,
         })
@@ -186,6 +211,64 @@ impl DnsWorker {
     }
 }
 
+enum DnsProvider {
+    Route53(Route53Provider),
+    Cloudflare(CloudflareProvider),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProviderKind {
+    Route53,
+    Cloudflare,
+}
+
+impl ProviderKind {
+    fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "route53" => Ok(Self::Route53),
+            "cloudflare" => Ok(Self::Cloudflare),
+            _ => Err("invalid BLOOM_RELAY_DNS_PROVIDER (expected route53 or cloudflare)"),
+        }
+    }
+}
+
+impl Provider for DnsProvider {
+    async fn publish_name(&self, records: NameRecords) -> Result<(), DnsError> {
+        match self {
+            Self::Route53(provider) => provider.publish_name(records).await,
+            Self::Cloudflare(provider) => provider.publish_name(records).await,
+        }
+    }
+
+    async fn create_txt(&self, lease: TxtLease) -> Result<(), DnsError> {
+        match self {
+            Self::Route53(provider) => provider.create_txt(lease).await,
+            Self::Cloudflare(provider) => provider.create_txt(lease).await,
+        }
+    }
+
+    async fn delete_txt(&self, lease: &TxtLease) -> Result<(), DnsError> {
+        match self {
+            Self::Route53(provider) => provider.delete_txt(lease).await,
+            Self::Cloudflare(provider) => provider.delete_txt(lease).await,
+        }
+    }
+
+    async fn retire_name(&self, hostname: &str) -> Result<(), DnsError> {
+        match self {
+            Self::Route53(provider) => provider.retire_name(hostname).await,
+            Self::Cloudflare(provider) => provider.retire_name(hostname).await,
+        }
+    }
+
+    async fn retire_challenge(&self, hostname: &str) -> Result<(), DnsError> {
+        match self {
+            Self::Route53(provider) => provider.retire_challenge(hostname).await,
+            Self::Cloudflare(provider) => provider.retire_challenge(hostname).await,
+        }
+    }
+}
+
 fn job_allowed(scope: DnsJobScope, kind: &str) -> bool {
     match scope {
         DnsJobScope::Serving => matches!(kind, "publish_name" | "remove_records"),
@@ -204,6 +287,17 @@ fn addresses(key: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::Error + Send 
     Ok(parsed)
 }
 
+fn cloudflare_token(path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut contents = String::new();
+    std::fs::File::open(path)?
+        .take(4097)
+        .read_to_string(&mut contents)?;
+    if contents.len() > 4096 {
+        return Err("Cloudflare token file too large".into());
+    }
+    Ok(contents.trim_end_matches(['\r', '\n']).to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +307,16 @@ mod tests {
         assert!(!job_allowed(DnsJobScope::Serving, "publish_txt"));
         assert!(job_allowed(DnsJobScope::Challenge, "remove_txt_all"));
         assert!(!job_allowed(DnsJobScope::Challenge, "remove_records"));
+    }
+
+    #[test]
+    fn provider_selector_is_explicit_and_rejects_unknown_values() {
+        assert_eq!(ProviderKind::parse("route53"), Ok(ProviderKind::Route53));
+        assert_eq!(
+            ProviderKind::parse("cloudflare"),
+            Ok(ProviderKind::Cloudflare)
+        );
+        assert!(ProviderKind::parse("").is_err());
+        assert!(ProviderKind::parse("CLOUDFLARE").is_err());
     }
 }
