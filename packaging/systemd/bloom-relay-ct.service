@@ -1,0 +1,35 @@
+[Unit]
+Description=Bloom relay certificate transparency monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bloom-relay-ct
+Group=bloom-relay-ct
+SupplementaryGroups=bloom-relay-witness
+EnvironmentFile=/etc/bloom-relay/ct.env
+Environment=BLOOM_RELAY_CT_FEED_CA_PATH=%d/feed-ca
+Environment=BLOOM_RELAY_CT_ALERT_CA_PATH=%d/alert-ca
+Environment=BLOOM_RELAY_CT_FEED_TOKEN_PATH=%d/feed-token
+Environment=BLOOM_RELAY_CT_ALERT_TOKEN_PATH=%d/alert-token
+LoadCredential=feed-ca:/etc/bloom-relay/ct-feed-ca.pem
+LoadCredential=alert-ca:/etc/bloom-relay/ct-alert-ca.pem
+LoadCredential=feed-token:/etc/bloom-relay/ct-feed-token
+LoadCredential=alert-token:/etc/bloom-relay/ct-alert-token
+ExecStart=/usr/local/libexec/bloom-relay/bloom-relay-ct
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+UMask=0007
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/bloom-relay/witness
+
+[Install]
+WantedBy=multi-user.target

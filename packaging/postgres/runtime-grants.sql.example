@@ -1,0 +1,52 @@
+-- Apply as the schema owner after bloom-relay-migrate. PostgreSQL peer auth
+-- maps each non-root service UID to its matching LOGIN role; no DB password
+-- is placed in an environment file. Review these grants after each migration.
+CREATE ROLE "bloom-relay-gateway" LOGIN;
+CREATE ROLE "bloom-relay-api" LOGIN;
+CREATE ROLE "bloom-relay-dns-serving" LOGIN;
+CREATE ROLE "bloom-relay-dns-challenge" LOGIN;
+CREATE ROLE "bloom-relay-ct" LOGIN;
+
+GRANT CONNECT ON DATABASE relay TO "bloom-relay-gateway", "bloom-relay-api",
+  "bloom-relay-dns-serving", "bloom-relay-dns-challenge", "bloom-relay-ct";
+GRANT USAGE ON SCHEMA public TO "bloom-relay-gateway", "bloom-relay-api",
+  "bloom-relay-dns-serving", "bloom-relay-dns-challenge", "bloom-relay-ct";
+GRANT SELECT ON _sqlx_migrations TO "bloom-relay-gateway", "bloom-relay-api",
+  "bloom-relay-dns-serving", "bloom-relay-dns-challenge", "bloom-relay-ct";
+GRANT SELECT, UPDATE ON restore_fence TO "bloom-relay-gateway", "bloom-relay-api",
+  "bloom-relay-dns-serving", "bloom-relay-dns-challenge", "bloom-relay-ct";
+GRANT INSERT ON security_audit TO "bloom-relay-gateway", "bloom-relay-api",
+  "bloom-relay-dns-serving", "bloom-relay-dns-challenge", "bloom-relay-ct";
+GRANT USAGE ON SEQUENCE security_audit_id_seq TO "bloom-relay-gateway", "bloom-relay-api",
+  "bloom-relay-dns-serving", "bloom-relay-dns-challenge", "bloom-relay-ct";
+GRANT SELECT ON installations, ct_feed_checkpoints TO "bloom-relay-gateway",
+  "bloom-relay-dns-serving", "bloom-relay-dns-challenge", "bloom-relay-ct";
+
+-- Only the signed API process can create/revoke installation authority.
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO "bloom-relay-api";
+GRANT INSERT, UPDATE, DELETE ON installations, hostname_reservations, operations,
+  used_nonces, bootstrap_challenges, scoped_credentials,
+  scoped_bearer_credentials, tunnel_leases, challenge_leases,
+  certificate_inventory, outbox TO "bloom-relay-api";
+GRANT USAGE ON SEQUENCE outbox_id_seq TO "bloom-relay-api";
+
+-- Gateway can only advance a lease generation and its own tunnel lease.
+GRANT SELECT ON scoped_bearer_credentials, tunnel_leases TO "bloom-relay-gateway";
+GRANT UPDATE (generation) ON installations TO "bloom-relay-gateway";
+GRANT INSERT, UPDATE ON tunnel_leases TO "bloom-relay-gateway";
+
+-- DNS workers can claim only their job types in code and mutate only their
+-- corresponding rows. IAM enforces the DNS record-type boundary separately.
+GRANT SELECT ON outbox TO "bloom-relay-dns-serving", "bloom-relay-dns-challenge";
+GRANT UPDATE (attempts, next_attempt_at, completed_at) ON outbox
+  TO "bloom-relay-dns-serving", "bloom-relay-dns-challenge";
+GRANT UPDATE (state) ON installations TO "bloom-relay-dns-serving";
+GRANT SELECT ON challenge_leases TO "bloom-relay-dns-challenge";
+GRANT UPDATE (dns_ready_at) ON challenge_leases TO "bloom-relay-dns-challenge";
+
+GRANT SELECT ON certificate_inventory, ct_observations, ct_alerts,
+  ct_health_alerts TO "bloom-relay-ct";
+GRANT INSERT, UPDATE ON ct_feed_checkpoints TO "bloom-relay-ct";
+GRANT INSERT ON ct_observations, ct_alerts, ct_health_alerts TO "bloom-relay-ct";
+GRANT UPDATE (delivered_at) ON ct_alerts, ct_health_alerts TO "bloom-relay-ct";
+GRANT USAGE ON SEQUENCE ct_alerts_id_seq, ct_health_alerts_id_seq TO "bloom-relay-ct";
