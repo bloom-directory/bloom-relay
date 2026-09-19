@@ -390,16 +390,18 @@ impl TunnelClient {
                     let frame = frame.map_err(|_| ClientError::Transport)?;
                     events.flow_control().release_capacity(frame.len()).map_err(|_| ClientError::Transport)?;
                     for event in decoder.push(&frame).map_err(|_| ClientError::Transport)? {
-                        if let TunnelEvent::Open { version, ticket, hostname, expires_at_ms, .. } = event {
+                        if let TunnelEvent::Open { version, ticket, hostname, generation, expires_at_ms, .. } = event {
                             if version != WIRE_VERSION { return Err(ClientError::IncompatibleProtocol { offered: version, supported: WIRE_VERSION }); }
                             if hostname != self.config.hostname || expires_at_ms <= now_ms() { continue; }
                             let upstream = self.upstream;
                             let authority = self.config.hostname.clone();
+                            let installation_id = self.config.installation_id;
+                            let credential = credential.clone();
                             let mut sender = sender.clone();
                             let Ok(permit) = streams.clone().try_acquire_owned() else { continue; };
                             tasks.spawn(async move {
                                 let _permit = permit;
-                                open_stream(&mut sender, upstream, &authority, &ticket).await.map(|_| false)
+                                open_stream(&mut sender, upstream, &authority, installation_id, generation, &credential, &ticket).await.map(|_| false)
                             });
                         }
                     }
@@ -480,11 +482,22 @@ async fn open_stream(
     sender: &mut client::SendRequest<Bytes>,
     upstream: SocketAddr,
     hostname: &str,
+    installation_id: uuid::Uuid,
+    generation: u64,
+    credential: &str,
     ticket: &str,
 ) -> Result<(), ClientError> {
     timeout(
         Duration::from_secs(1800),
-        open_stream_inner(sender, upstream, hostname, ticket),
+        open_stream_inner(
+            sender,
+            upstream,
+            hostname,
+            installation_id,
+            generation,
+            credential,
+            ticket,
+        ),
     )
     .await
     .map_err(|_| ClientError::Transport)?
@@ -494,6 +507,9 @@ async fn open_stream_inner(
     sender: &mut client::SendRequest<Bytes>,
     upstream: SocketAddr,
     hostname: &str,
+    installation_id: uuid::Uuid,
+    generation: u64,
+    credential: &str,
     ticket: &str,
 ) -> Result<(), ClientError> {
     let uri: Uri = format!("https://{hostname}")
@@ -502,6 +518,11 @@ async fn open_stream_inner(
     let request = Request::builder()
         .method(Method::CONNECT)
         .uri(uri)
+        .header("x-bloom-version", WIRE_VERSION.to_string())
+        .header("x-bloom-installation", installation_id.to_string())
+        .header("x-bloom-hostname", hostname)
+        .header("x-bloom-generation", generation.to_string())
+        .header("authorization", format!("Bearer {credential}"))
         .header("x-bloom-ticket", ticket)
         .body(())
         .map_err(|_| ClientError::InvalidConfiguration)?;

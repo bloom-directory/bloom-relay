@@ -23,7 +23,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -34,7 +34,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 struct Tunnel {
     id: Uuid,
     generation: u64,
-    control: Mutex<SendStream<Bytes>>,
+    control: mpsc::Sender<Bytes>,
+    cancel: watch::Sender<bool>,
     streams: Arc<Semaphore>,
 }
 struct Ticket {
@@ -50,7 +51,11 @@ struct Gateway {
     tunnels: Mutex<HashMap<String, Arc<Tunnel>>>,
     tickets: Mutex<HashMap<String, Ticket>>,
     streams: Arc<Semaphore>,
+    lifecycles: Arc<Semaphore>,
 }
+
+const MAX_TUNNEL_LIFECYCLES: usize = 5_000;
+const MAX_TUNNEL_LIFECYCLES_PER_CONNECTION: usize = 256;
 
 struct IngressQuota {
     state: StdMutex<(Instant, u32, HashMap<IpAddr, u32>)>,
@@ -112,6 +117,7 @@ async fn main() -> Result<(), Error> {
         streams: Arc::new(Semaphore::new(
             MAX_GATEWAY_STREAMS.min(BUFFER_BUDGET / (2 * BUFFER_PER_DIRECTION)),
         )),
+        lifecycles: Arc::new(Semaphore::new(MAX_TUNNEL_LIFECYCLES)),
     });
     let witness = RestoreWitness::new(witness_path.into())?;
     witness.verify_and_advance(&gateway.store).await?;
@@ -242,27 +248,43 @@ async fn control_connection(
     if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
         return Err("HTTP/2 required".into());
     }
-    let mut connection = server::handshake(tls).await?;
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-    let mut active: Option<(String, Arc<Tunnel>)> = None;
+    let connection = server::handshake(tls).await?;
+    let (connection_shutdown, _) = watch::channel(false);
+    let mut lifecycles = JoinSet::new();
+    let result = serve_control_connection(
+        gateway,
+        connection,
+        connection_shutdown.clone(),
+        &mut lifecycles,
+    )
+    .await;
+    connection_shutdown.send_replace(true);
+    while lifecycles.join_next().await.is_some() {}
+    result
+}
+
+async fn serve_control_connection<T>(
+    gateway: Arc<Gateway>,
+    mut connection: server::Connection<T, Bytes>,
+    connection_shutdown: watch::Sender<bool>,
+    lifecycles: &mut JoinSet<()>,
+) -> Result<(), Error>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let local_lifecycles = Arc::new(Semaphore::new(MAX_TUNNEL_LIFECYCLES_PER_CONNECTION));
     loop {
         let request = tokio::select! {
             request = connection.accept() => request,
-            _ = heartbeat.tick() => {
-                if let Some((host, tunnel)) = &active {
-                    if !gateway.store.renew_tunnel(tunnel.id, &gateway.gateway_id, tunnel.generation).await? {
-                        bloom_relay_observe::count("bloom_relay_tunnel_lease_fenced_total");
-                        break;
-                    }
-                    let event = TunnelEvent::Heartbeat { version: WIRE_VERSION, generation: tunnel.generation };
-                    send_data(&mut *tunnel.control.lock().await, Bytes::from(format!("{}\n", serde_json::to_string(&event)?))).await?;
-                    if gateway.tunnels.lock().await.get(host).is_none_or(|current| current.generation != tunnel.generation) { break; }
+            completed = lifecycles.join_next(), if !lifecycles.is_empty() => {
+                if completed.is_some_and(|result| result.is_err()) {
+                    bloom_relay_observe::count("bloom_relay_tunnel_lifecycle_failed_total");
                 }
                 continue;
             }
         };
         let Some(request) = request else {
-            break;
+            return Ok(());
         };
         let (request, mut response) = request?;
         if request.method() == Method::POST && request.uri().path() == "/v1/tunnel" {
@@ -308,73 +330,169 @@ async fn control_connection(
             }
             let id = id.ok_or("missing installation")?;
             let host = host.ok_or("missing hostname")?;
+            let Ok(local_permit) = local_lifecycles.clone().try_acquire_owned() else {
+                response.send_response(
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(())?,
+                    true,
+                )?;
+                continue;
+            };
+            let Ok(global_permit) = gateway.lifecycles.clone().try_acquire_owned() else {
+                response.send_response(
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(())?,
+                    true,
+                )?;
+                continue;
+            };
             let generation = gateway
                 .store
                 .claim_tunnel(id, &gateway.gateway_id, 45)
                 .await?;
+            let (control_tx, control_rx) = mpsc::channel(MAX_INSTALLATION_STREAMS);
+            let (cancel, cancelled) = watch::channel(false);
+            let mut tunnels = gateway.tunnels.lock().await;
+            if !generation_can_replace(
+                tunnels.get(host).map(|current| current.generation),
+                generation,
+            ) {
+                response.send_response(
+                    Response::builder().status(StatusCode::CONFLICT).body(())?,
+                    true,
+                )?;
+                continue;
+            }
             let control = response
                 .send_response(Response::builder().status(StatusCode::OK).body(())?, false)?;
             let tunnel = Arc::new(Tunnel {
                 id,
                 generation,
-                control: Mutex::new(control),
+                control: control_tx,
+                cancel,
                 streams: Arc::new(Semaphore::new(MAX_INSTALLATION_STREAMS)),
             });
-            if gateway
-                .tunnels
-                .lock()
-                .await
-                .insert(host.to_owned(), tunnel.clone())
-                .is_some()
-            {
+            let displaced = tunnels.insert(host.to_owned(), tunnel.clone());
+            drop(tunnels);
+            if let Some(displaced) = displaced {
+                displaced.cancel.send_replace(true);
                 bloom_relay_observe::count("bloom_relay_tunnel_reconnect_total");
             }
             bloom_relay_observe::count("bloom_relay_tunnel_claim_total");
-            active = Some((host.to_owned(), tunnel));
+            let gateway = gateway.clone();
+            let host = host.to_owned();
+            let backend_shutdown = connection_shutdown.subscribe();
+            lifecycles.spawn(async move {
+                let _local_permit = local_permit;
+                let _global_permit = global_permit;
+                tunnel_lifecycle(
+                    gateway,
+                    host,
+                    tunnel,
+                    control,
+                    control_rx,
+                    cancelled,
+                    backend_shutdown,
+                )
+                .await;
+            });
         } else if request.method() == Method::CONNECT {
-            let claim = if let Some(ticket) = request
+            let version = request
+                .headers()
+                .get("x-bloom-version")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u16>().ok());
+            let id = request
+                .headers()
+                .get("x-bloom-installation")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let host = request
+                .headers()
+                .get("x-bloom-hostname")
+                .and_then(|value| value.to_str().ok());
+            let generation = request
+                .headers()
+                .get("x-bloom-generation")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let token = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "));
+            let authenticated = if let (Some(id), Some(host), Some(generation), Some(token)) =
+                (id, host, generation, token)
+            {
+                version == Some(WIRE_VERSION)
+                    && validate_hostname(host).is_ok()
+                    && gateway.store.hostname(id).await?.as_deref() == Some(host)
+                    && gateway
+                        .store
+                        .authenticate_bearer(id, "tunnel", token)
+                        .await?
+                        .is_some()
+                    && gateway
+                        .tunnels
+                        .lock()
+                        .await
+                        .get(host)
+                        .is_some_and(|tunnel| tunnel.id == id && tunnel.generation == generation)
+                    && gateway
+                        .store
+                        .tunnel_is_current(id, &gateway.gateway_id, generation)
+                        .await?
+            } else {
+                false
+            };
+            if !authenticated {
+                response.send_response(
+                    Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(())?,
+                    true,
+                )?;
+                continue;
+            }
+            let id = id.ok_or("authenticated CONNECT missing installation")?;
+            let host = host.ok_or("authenticated CONNECT missing hostname")?;
+            let generation = generation.ok_or("authenticated CONNECT missing generation")?;
+            let authority = request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str());
+            let ticket_key = request
                 .headers()
                 .get("x-bloom-ticket")
                 .and_then(|v| v.to_str().ok())
-            {
-                gateway.tickets.lock().await.remove(ticket)
+                .map(str::to_owned);
+            let claim = if let Some(ticket_key) = ticket_key {
+                let mut tickets = gateway.tickets.lock().await;
+                if tickets.get(&ticket_key).is_some_and(|ticket| {
+                    ticket_claim_matches(ticket, id, host, generation, authority, Instant::now())
+                }) {
+                    tickets.remove(&ticket_key)
+                } else {
+                    None
+                }
             } else {
                 None
             };
             if let Some(ticket) = claim {
-                let same_tunnel = active.as_ref().is_some_and(|(host, tunnel)| {
-                    ticket_owner_matches(
-                        host,
-                        tunnel.id,
-                        tunnel.generation,
-                        &ticket.host,
-                        ticket.id,
-                        ticket.generation,
-                    )
-                });
-                let valid = ticket.deadline > Instant::now()
-                    && same_tunnel
-                    && request
-                        .uri()
-                        .authority()
-                        .is_some_and(|authority| authority.as_str() == ticket.host)
+                let owns_tunnel = gateway
+                    .tunnels
+                    .lock()
+                    .await
+                    .get(host)
+                    .is_some_and(|tunnel| tunnel.id == id && tunnel.generation == generation);
+                let still_current = owns_tunnel
                     && gateway
                         .store
-                        .tunnel_is_current(ticket.id, &gateway.gateway_id, ticket.generation)
+                        .tunnel_is_current(id, &gateway.gateway_id, generation)
                         .await?;
-                #[cfg(test)]
-                if !valid {
-                    eprintln!(
-                        "rejected CONNECT: same_tunnel={same_tunnel} authority={:?} expected={} expired={} active={:?}",
-                        request.uri().authority(),
-                        ticket.host,
-                        ticket.deadline <= Instant::now(),
-                        active
-                            .as_ref()
-                            .map(|(host, tunnel)| (host, tunnel.id, tunnel.generation)),
-                    );
-                }
-                if valid {
+                if still_current {
                     let outbound = response.send_response(
                         Response::builder().status(StatusCode::OK).body(())?,
                         false,
@@ -391,16 +509,147 @@ async fn control_connection(
             )?;
         }
     }
-    if let Some((host, tunnel)) = active {
-        let mut tunnels = gateway.tunnels.lock().await;
-        if tunnels
-            .get(&host)
-            .is_some_and(|current| current.generation == tunnel.generation)
-        {
-            tunnels.remove(&host);
+}
+
+async fn tunnel_lifecycle(
+    gateway: Arc<Gateway>,
+    host: String,
+    tunnel: Arc<Tunnel>,
+    mut control: SendStream<Bytes>,
+    mut messages: mpsc::Receiver<Bytes>,
+    mut cancelled: watch::Receiver<bool>,
+    mut backend_shutdown: watch::Receiver<bool>,
+) {
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        enum Action {
+            Cancel,
+            Reset,
+            Message(Option<Bytes>),
+            Heartbeat,
+        }
+        let action = tokio::select! {
+            changed = cancelled.changed() => {
+                let _ = changed;
+                Action::Cancel
+            }
+            changed = backend_shutdown.changed() => {
+                let _ = changed;
+                Action::Cancel
+            }
+            _ = poll_fn(|context| control.poll_reset(context)) => Action::Reset,
+            message = messages.recv() => Action::Message(message),
+            _ = heartbeat.tick() => Action::Heartbeat,
+        };
+        let sent = match action {
+            Action::Cancel | Action::Reset | Action::Message(None) => break,
+            Action::Message(Some(message)) => {
+                send_lifecycle_data(&mut control, message, &mut cancelled, &mut backend_shutdown)
+                    .await
+            }
+            Action::Heartbeat => {
+                let owns_host = gateway
+                    .tunnels
+                    .lock()
+                    .await
+                    .get(&host)
+                    .is_some_and(|current| {
+                        current.id == tunnel.id && current.generation == tunnel.generation
+                    });
+                if !owns_host
+                    || !renew_lifecycle(&gateway, &tunnel, &mut cancelled, &mut backend_shutdown)
+                        .await
+                {
+                    bloom_relay_observe::count("bloom_relay_tunnel_lease_fenced_total");
+                    break;
+                }
+                let event = TunnelEvent::Heartbeat {
+                    version: WIRE_VERSION,
+                    generation: tunnel.generation,
+                };
+                match serde_json::to_string(&event) {
+                    Ok(event) => {
+                        send_lifecycle_data(
+                            &mut control,
+                            Bytes::from(format!("{event}\n")),
+                            &mut cancelled,
+                            &mut backend_shutdown,
+                        )
+                        .await
+                    }
+                    Err(_) => break,
+                }
+            }
+        };
+        if !sent {
+            break;
         }
     }
-    Ok(())
+    let mut tunnels = gateway.tunnels.lock().await;
+    if tunnels
+        .get(&host)
+        .is_some_and(|current| current.id == tunnel.id && current.generation == tunnel.generation)
+    {
+        tunnels.remove(&host);
+    }
+}
+
+async fn renew_lifecycle(
+    gateway: &Gateway,
+    tunnel: &Tunnel,
+    cancelled: &mut watch::Receiver<bool>,
+    backend_shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = gateway.store.renew_tunnel(tunnel.id, &gateway.gateway_id, tunnel.generation) => result.unwrap_or(false),
+            _ = cancelled.changed() => false,
+            _ = backend_shutdown.changed() => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn send_lifecycle_data(
+    control: &mut SendStream<Bytes>,
+    message: Bytes,
+    cancelled: &mut watch::Receiver<bool>,
+    backend_shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = send_data(control, message) => result.is_ok(),
+            _ = cancelled.changed() => false,
+            _ = backend_shutdown.changed() => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn ticket_claim_matches(
+    ticket: &Ticket,
+    id: Uuid,
+    host: &str,
+    generation: u64,
+    authority: Option<&str>,
+    now: Instant,
+) -> bool {
+    ticket.deadline > now
+        && authority == Some(ticket.host.as_str())
+        && ticket_owner_matches(
+            host,
+            id,
+            generation,
+            &ticket.host,
+            ticket.id,
+            ticket.generation,
+        )
+}
+
+fn generation_can_replace(current: Option<u64>, candidate: u64) -> bool {
+    current.is_none_or(|generation| generation < candidate)
 }
 
 async fn browser_connection(gateway: Arc<Gateway>, mut browser: TcpStream) -> Result<(), Error> {
@@ -423,13 +672,14 @@ async fn browser_connection(gateway: Arc<Gateway>, mut browser: TcpStream) -> Re
     }
     let ticket = Uuid::new_v4().to_string();
     let (claim, receiver) = oneshot::channel();
+    let setup_deadline = Instant::now() + Duration::from_secs(10);
     gateway.tickets.lock().await.insert(
         ticket.clone(),
         Ticket {
             host: host.clone(),
             id: tunnel.id,
             generation: tunnel.generation,
-            deadline: Instant::now() + Duration::from_secs(10),
+            deadline: setup_deadline,
             claim,
         },
     );
@@ -442,12 +692,21 @@ async fn browser_connection(gateway: Arc<Gateway>, mut browser: TcpStream) -> Re
         expires_at_ms: now_ms() + 10_000,
     };
     let message = format!("{}\n", serde_json::to_string(&event)?);
-    timeout(
-        Duration::from_secs(10),
-        send_data(&mut *tunnel.control.lock().await, Bytes::from(message)),
+    let sent = timeout(
+        setup_deadline.saturating_duration_since(Instant::now()),
+        tunnel.control.send(Bytes::from(message)),
     )
-    .await??;
-    let result = timeout(Duration::from_secs(10), receiver).await;
+    .await
+    .is_ok_and(|result| result.is_ok());
+    if !sent {
+        gateway.tickets.lock().await.remove(&ticket);
+        return Err("tunnel control stream unavailable".into());
+    }
+    let result = timeout(
+        setup_deadline.saturating_duration_since(Instant::now()),
+        receiver,
+    )
+    .await;
     gateway.tickets.lock().await.remove(&ticket);
     let (incoming, outgoing) = result??;
     timeout(
@@ -561,7 +820,7 @@ fn ticket_owner_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_relay_client::{CEREMONY_UPSTREAM, TunnelClient, TunnelConfig};
+    use bloom_relay_client::{CEREMONY_UPSTREAM, ClientError, TunnelClient, TunnelConfig};
     use proptest::prelude::*;
     use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
     use sha2::{Digest, Sha256};
@@ -583,6 +842,59 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    async fn raw_tunnel_post(
+        sender: &mut h2::client::SendRequest<Bytes>,
+        id: Uuid,
+        host: &str,
+        token: &str,
+    ) -> RecvStream {
+        let request = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://relay-control.bloom.directory/v1/tunnel")
+            .header("x-bloom-version", WIRE_VERSION.to_string())
+            .header("x-bloom-installation", id.to_string())
+            .header("x-bloom-hostname", host)
+            .header("authorization", format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (response, _) = sender.send_request(request, true).unwrap();
+        let response = timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body()
+    }
+
+    async fn raw_connect(
+        sender: &mut h2::client::SendRequest<Bytes>,
+        id: Uuid,
+        host: &str,
+        generation: u64,
+        token: Option<&str>,
+        ticket: &str,
+    ) -> StatusCode {
+        let mut request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{host}"))
+            .header("x-bloom-version", WIRE_VERSION.to_string())
+            .header("x-bloom-installation", id.to_string())
+            .header("x-bloom-hostname", host)
+            .header("x-bloom-generation", generation.to_string())
+            .header("x-bloom-ticket", ticket);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let (response, _outbound) = sender
+            .send_request(request.body(()).unwrap(), false)
+            .unwrap();
+        timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .status()
     }
 
     #[tokio::test]
@@ -677,6 +989,63 @@ mod tests {
         assert!(quota.allow_at(first, start + Duration::from_secs(60)));
     }
 
+    #[test]
+    fn connect_ticket_requires_exact_unexpired_owner_tuple() {
+        let id = Uuid::new_v4();
+        let host = "abcdefghijklmnopqrstuv2345.relay.bloom.directory";
+        let now = Instant::now();
+        let (claim, _receiver) = oneshot::channel();
+        let ticket = Ticket {
+            host: host.into(),
+            id,
+            generation: 7,
+            deadline: now + Duration::from_secs(10),
+            claim,
+        };
+        assert!(ticket_claim_matches(&ticket, id, host, 7, Some(host), now));
+        assert!(!ticket_claim_matches(
+            &ticket,
+            Uuid::new_v4(),
+            host,
+            7,
+            Some(host),
+            now
+        ));
+        assert!(!ticket_claim_matches(
+            &ticket,
+            id,
+            "bcdefghijklmnopqrstuv23456.relay.bloom.directory",
+            7,
+            Some(host),
+            now
+        ));
+        assert!(!ticket_claim_matches(&ticket, id, host, 8, Some(host), now));
+        assert!(!ticket_claim_matches(
+            &ticket,
+            id,
+            host,
+            7,
+            Some("bcdefghijklmnopqrstuv23456.relay.bloom.directory"),
+            now
+        ));
+        assert!(!ticket_claim_matches(
+            &ticket,
+            id,
+            host,
+            7,
+            Some(host),
+            ticket.deadline
+        ));
+    }
+
+    #[test]
+    fn reconnect_generation_replacement_is_monotonic() {
+        assert!(generation_can_replace(None, 1));
+        assert!(generation_can_replace(Some(6), 7));
+        assert!(!generation_can_replace(Some(7), 7));
+        assert!(!generation_can_replace(Some(8), 7));
+    }
+
     proptest! {
         #[test]
         fn ingress_quota_never_exceeds_source_or_global_budget(
@@ -730,8 +1099,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Docker, haproxy:3.2-alpine, and BLOOM_RELAY_TEST_DATABASE_URL"]
-    async fn haproxy_h2_preserves_tunnel_connection_binding() {
+    #[ignore = "requires Docker, a HAProxy 3.x image, and BLOOM_RELAY_TEST_DATABASE_URL"]
+    async fn haproxy_h2_routes_authenticated_tunnels_across_backend_connections() {
         let url = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL")
             .expect("BLOOM_RELAY_TEST_DATABASE_URL must name a disposable database");
         run_opaque_tls_fixture(&url, true).await;
@@ -818,6 +1187,7 @@ mod tests {
             streams: Arc::new(Semaphore::new(
                 MAX_GATEWAY_STREAMS.min(BUFFER_BUDGET / (2 * BUFFER_PER_DIRECTION)),
             )),
+            lifecycles: Arc::new(Semaphore::new(MAX_TUNNEL_LIFECYCLES)),
         });
         let control = TcpListener::bind(if through_haproxy {
             "0.0.0.0:0"
@@ -884,6 +1254,8 @@ backend reject
             let name = format!("bloom-relay-haproxy-{}", Uuid::new_v4());
             let mount = format!("{}:/fixture:ro", fixture.to_string_lossy());
             let publish = format!("127.0.0.1:{frontend_port}:8443");
+            let image = std::env::var("BLOOM_RELAY_TEST_HAPROXY_IMAGE")
+                .unwrap_or_else(|_| "haproxy:3.2-alpine".into());
             let child = Command::new("docker")
                 .args([
                     "run",
@@ -896,7 +1268,7 @@ backend reject
                     &publish,
                     "--volume",
                     &mount,
-                    "haproxy:3.2-alpine",
+                    &image,
                     "haproxy",
                     "-db",
                     "-f",
@@ -1002,6 +1374,194 @@ backend reject
             .unwrap()
             .generation;
 
+        // A separate backend HTTP/2 connection cannot rely on the POST stream's
+        // connection-local state. Exercise per-CONNECT authentication and ticket
+        // ownership before the opaque TLS happy path below.
+        let raw_tcp = TcpStream::connect(control_address).await.unwrap();
+        let raw_tls = tokio_rustls::TlsConnector::from(client_tls.clone())
+            .connect(
+                ServerName::try_from("relay-control.bloom.directory").unwrap(),
+                raw_tcp,
+            )
+            .await
+            .unwrap();
+        let (mut raw_sender, raw_connection) = h2::client::handshake(raw_tls).await.unwrap();
+        let raw_connection_task = tokio::spawn(raw_connection);
+
+        let mut extra = Vec::new();
+        for marker in [8u8, 9u8] {
+            let created = store
+                .allocate(Uuid::new_v4(), [marker; 32], "fixture")
+                .await
+                .unwrap();
+            store
+                .register_acme_account(
+                    created.installation_id,
+                    &format!("https://acme-v02.api.letsencrypt.org/acme/acct/{marker}"),
+                )
+                .await
+                .unwrap();
+            store.mark_dns_ready(created.installation_id).await.unwrap();
+            let extra_token = char::from(b'a' + marker).to_string().repeat(43);
+            let extra_hash: [u8; 32] = Sha256::digest(extra_token.as_bytes()).into();
+            store
+                .issue_bearer(
+                    created.installation_id,
+                    Uuid::new_v4(),
+                    "tunnel",
+                    extra_hash,
+                    3600,
+                )
+                .await
+                .unwrap();
+            extra.push((created, extra_token));
+        }
+        let extra_body_a = raw_tunnel_post(
+            &mut raw_sender,
+            extra[0].0.installation_id,
+            &extra[0].0.hostname,
+            &extra[0].1,
+        )
+        .await;
+        let extra_body_b = raw_tunnel_post(
+            &mut raw_sender,
+            extra[1].0.installation_id,
+            &extra[1].0.hostname,
+            &extra[1].1,
+        )
+        .await;
+        let extra_generation = gateway
+            .tunnels
+            .lock()
+            .await
+            .get(&extra[0].0.hostname)
+            .unwrap()
+            .generation;
+        let extra_generation_b = gateway
+            .tunnels
+            .lock()
+            .await
+            .get(&extra[1].0.hostname)
+            .unwrap()
+            .generation;
+
+        let test_ticket = Uuid::new_v4().to_string();
+        let (claim, claimed) = oneshot::channel();
+        gateway.tickets.lock().await.insert(
+            test_ticket.clone(),
+            Ticket {
+                host: allocation.hostname.clone(),
+                id,
+                generation: first_generation,
+                deadline: Instant::now() + Duration::from_secs(10),
+                claim,
+            },
+        );
+        assert_eq!(
+            raw_connect(
+                &mut raw_sender,
+                id,
+                &allocation.hostname,
+                first_generation,
+                None,
+                &test_ticket,
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(gateway.tickets.lock().await.contains_key(&test_ticket));
+        let wrong_token = "z".repeat(43);
+        assert_eq!(
+            raw_connect(
+                &mut raw_sender,
+                id,
+                &allocation.hostname,
+                first_generation,
+                Some(&wrong_token),
+                &test_ticket,
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(gateway.tickets.lock().await.contains_key(&test_ticket));
+        assert_eq!(
+            raw_connect(
+                &mut raw_sender,
+                extra[0].0.installation_id,
+                &extra[0].0.hostname,
+                extra_generation,
+                Some(&extra[0].1),
+                &test_ticket,
+            )
+            .await,
+            StatusCode::GONE
+        );
+        assert!(gateway.tickets.lock().await.contains_key(&test_ticket));
+        assert_eq!(
+            raw_connect(
+                &mut raw_sender,
+                id,
+                &allocation.hostname,
+                first_generation.saturating_sub(1),
+                Some(&token),
+                &test_ticket,
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(gateway.tickets.lock().await.contains_key(&test_ticket));
+        assert_eq!(
+            raw_connect(
+                &mut raw_sender,
+                id,
+                &allocation.hostname,
+                first_generation,
+                Some(&token),
+                &test_ticket,
+            )
+            .await,
+            StatusCode::OK
+        );
+        let _claimed_stream = claimed.await.unwrap();
+        assert!(!gateway.tickets.lock().await.contains_key(&test_ticket));
+        assert_eq!(
+            raw_connect(
+                &mut raw_sender,
+                id,
+                &allocation.hostname,
+                first_generation,
+                Some(&token),
+                &test_ticket,
+            )
+            .await,
+            StatusCode::GONE
+        );
+
+        drop(extra_body_a);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if !gateway
+                    .tunnels
+                    .lock()
+                    .await
+                    .contains_key(&extra[0].0.hostname)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            gateway
+                .tunnels
+                .lock()
+                .await
+                .get(&extra[1].0.hostname)
+                .is_some_and(|tunnel| tunnel.generation == extra_generation_b)
+        );
+
         let mut browser_tls = ClientConfig::builder()
             .with_root_certificates({
                 let mut roots = RootCertStore::empty();
@@ -1078,8 +1638,11 @@ backend reject
         );
         let _ = stop.send(());
         let _ = stop_second.send(());
-        first.await.unwrap().unwrap();
+        assert!(matches!(first.await.unwrap(), Err(ClientError::Transport)));
+        assert!(!*watched.borrow());
         second.await.unwrap().unwrap();
+        drop(extra_body_b);
+        raw_connection_task.abort();
         control_task.abort();
         ingress_task.abort();
         drop(haproxy);

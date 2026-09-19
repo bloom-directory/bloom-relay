@@ -37,9 +37,22 @@ connection gets an `Open` event on that stream, newline-delimited JSON
 regardless of HTTP/2 DATA boundaries. The event carries the exact hostname,
 installation lease generation, random single-use ticket, connection ID, and
 ten-second absolute expiry. Broker opens one outbound CONNECT for the ticket.
-The gateway accepts CONNECT only on the same authenticated HTTP/2 connection,
-with matching authority, current generation and unexpired ticket. The
-connected DATA streams carry opaque Browser TLS bytes.
+Every CONNECT independently carries the tunnel protocol version, installation
+UUID, exact allocated hostname, lease generation and scoped tunnel bearer so
+HTTP/2 intermediaries may use a different backend connection safely. The
+gateway authenticates those fields and the live tunnel before atomically
+claiming a matching unexpired ticket; failed authentication or a foreign owner
+cannot consume another tunnel's ticket. The connected DATA streams carry opaque
+Browser TLS bytes. These required CONNECT headers are a pre-release v1 contract
+change, so every dependent Broker pin must move with the relay update.
+
+Each backend HTTP/2 connection admits at most 256 concurrent tunnel lifecycle
+tasks, with 5,000 across a gateway process. Control-frame writes and lease
+renewals each have a ten-second deadline and observe stream reset, reconnect and
+backend shutdown cancellation. A CONNECT performs a final current-generation
+check after claiming its ticket. A stream already accepted before a later
+generation claim may drain under the normal 30-minute stream bound; no new
+stream can attach to the fenced generation.
 
 The privileged administrator issues a 24-hour random bearer by sending only
 its SHA-256 digest in a signed request. The receipt gives the exact database
