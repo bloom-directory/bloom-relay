@@ -1,7 +1,8 @@
 # Relay operations and deployment gates
 
-This repository contains implementation work but is not deployed. No DNS,
-cloud, wallet or certificate mutation runs in local tests.
+The initial production host is provisioned with public enrollment closed; see
+[deployment evidence](deployments/2026-09-19.md). No DNS, cloud, wallet or
+certificate mutation runs in local tests.
 The reviewable Linux release templates and role grants are in
 [`package.md`](package.md); their installation and live drills are still
 deployment actions.
@@ -12,7 +13,7 @@ decision, ingress IPv4 and IPv6 addresses, shard placement, PostgreSQL service
 and backup owner, and separate workload identities for gateway, control administration
 and DNS reconciliation. The gateway must have no DNS provider permission.
 For Route 53, restrict DNS roles to the delegated zone and exact record types.
-The `relay-control.bloom.directory` TLS identity and offline receipt-signing
+The `relay-control.bloom.directory` TLS identity and receipt-signing
 key need separate protected provisioning and rotation procedures.
 
 The API process takes its PostgreSQL URL, bind address, placement, TLS
@@ -51,10 +52,16 @@ per minute; pending allocations expire after 24 hours. Browser ingress
 admits at most 120 new TLS connections per source IP and 5,000 globally per
 fixed minute. Tune these values from capacity/NAT measurements before public
 opening while retaining Broker's installation and recovery-ID quotas.
+In the packaged topology, the API sees HAProxy's loopback address rather than
+the enrollment client's address, so every public bootstrap shares the same
+10-per-minute source bucket. Before public enrollment, add an authenticated,
+trusted client-address transport and make the API consume it without accepting
+an unrestricted forwarded-address header. This does not affect the gateway's
+direct Browser-ingress source quota.
 
-For the intended Cloudflare rollout, use the authoritative `bloom.directory`
-zone and record its zone ID and nameservers in the restricted operations
-inventory. The relay's assigned names remain under `relay.bloom.directory`;
+The selected rollout uses a separately delegated Route 53 child zone. For an
+alternative Cloudflare deployment, record the authoritative zone ID and
+nameservers in the restricted operations inventory. The relay's assigned names remain under `relay.bloom.directory`;
 use exact, DNS-only A/AAAA/CAA records and exact `_acme-challenge` TXT records.
 Use the Cloudflare zone ID in both worker env files, the public ingress address
 in `BLOOM_RELAY_INGRESS_ADDRESSES`, and the zone's authoritative DNS server

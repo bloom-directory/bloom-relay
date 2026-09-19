@@ -99,10 +99,10 @@ host/port, command, filesystem path, Machine RPC or Signer destination.
 
 ## DNS and public ingress
 
-Route 53 and Cloudflare are supported behind the narrow DNS adapter. The intended
-rollout uses Cloudflare's existing authoritative `bloom.directory` zone while
-assigned names remain under `relay.bloom.directory`. Route 53 remains available
-for a separately delegated relay zone. Record provider ownership, zone ID,
+Route 53 and Cloudflare are supported behind the narrow DNS adapter. The selected
+production topology delegates `relay.bloom.directory` to Route 53 while the parent
+`bloom.directory` remains on Cloudflare. This limits the relay credentials to the
+child zone and enables provider-enforced record-type restrictions. Record provider ownership, zone ID,
 nameservers, optional DNSSEC/DS decision and ingress addresses before production;
 they are not application-controlled or assumed to be deployed. Provider choice
 does not change installation identity or protocol. Cloudflare zone-level API

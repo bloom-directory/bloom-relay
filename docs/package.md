@@ -20,8 +20,11 @@ mutations. The included corpus seeds are fixed protocol fixtures, not secrets.
 Use a dedicated, non-root Unix user and matching PostgreSQL peer role for each
 of `bloom-relay-gateway`, `bloom-relay-api`, `bloom-relay-dns-serving`,
 `bloom-relay-dns-challenge`, and `bloom-relay-ct`. Run
-`bloom-relay-migrate` once as the schema owner before any service; runtime
-processes only validate the exact migration set and need no DDL privileges.
+`bloom-relay-migrate` once as the schema owner before any service, using an
+explicit database username such as
+`BLOOM_RELAY_DATABASE_URL=postgresql://postgres@localhost/relay?host=/run/postgresql`.
+Runtime processes use the explicit matching usernames in the environment examples,
+validate the exact migration set, and need no DDL privileges.
 Apply `packaging/postgres/runtime-grants.sql.example` as the schema owner
 after selecting the production database name. Test each role's allowed and
 denied operations under `SET ROLE` during staging acceptance. PostgreSQL peer
@@ -46,6 +49,11 @@ gateway's admission quota. HAProxy terminates the unrelated outer control
 TLS on the control IP and forwards `/v1/tunnel` and CONNECT to the gateway's
 loopback HTTP/2 listener; other control requests go to the API's loopback TLS
 listener. `packaging/haproxy/relay-control.cfg.example` shows the route.
+The API currently observes HAProxy's loopback address for bootstrap challenge
+rate limiting and challenge/enrollment source binding. This makes all public
+callers share one source quota. Resolve this with an authenticated, trusted
+client-address transport before public enrollment; never trust an unrestricted
+forwarded-address header.
 Validate the HAProxy configuration and real HTTP/2 CONNECT behavior with the
 chosen version in staging. Do not proxy Browser ingress without preserving a
 trusted source-IP signal. Control certificate/key copies are accessible only
@@ -56,7 +64,8 @@ The Route 53 serving role may list the delegated zone and change only
 A/AAAA/CAA; the DNS-01 role may list the zone and change only TXT at
 `_acme-challenge.*.relay.bloom.directory`. The reviewed policy examples use
 Route 53's record-name, type, action and hosted-zone conditions. Replace the
-zone ID and validate both allowed and denied calls with the real identity.
+zone ID, set `AWS_REGION=us-east-1` for the Rust SDK, and validate both allowed
+and denied calls with the real identity.
 The worker's typed outbox scope and provider methods add an exact assigned
 hostname check. The API and gateway must have no Route 53 permission.
 
@@ -99,3 +108,32 @@ interrupted job. To roll back a binary, stop services, keep the witness and
 database schema intact, and use only a binary compatible with the current
 wire/schema version. Database restore requires external audit and certificate
 inventory comparison before services restart.
+
+## Control certificate renewal on Debian
+
+For a Certbot-managed public control certificate, install
+`packaging/renew-control-certificate.sh` as
+`/etc/letsencrypt/renewal-hooks/deploy/bloom-relay`, mode `0755`. It expects the
+lineage `/etc/letsencrypt/live/relay-control.bloom.directory`, validates the
+hostname, validity, chain and matching key, and publishes a private generation
+under `/etc/bloom-relay/tls` through an atomic symlink. Create these root-owned
+symlinks before first service activation:
+
+```
+/etc/bloom-relay/control-cert.pem -> tls/current/fullchain.pem
+/etc/bloom-relay/control-key.pem -> tls/current/privkey.pem
+/etc/bloom-relay/control-haproxy.pem -> tls/current/haproxy.pem
+```
+
+Run the hook once to initialize the generation. It serializes invocations with
+`flock`, refreshes running API/gateway systemd credentials by restarting those
+services, and validates/reloads HAProxy. A refresh failure returns nonzero for
+operator attention; publication does not claim power-loss durability or automatic
+service rollback. Retained private generations support operator recovery; prune
+unused generations under the site's key-retention policy. Certbot's lineage
+remains the source of truth. A renewal restart can interrupt live tunnels; Broker
+must reconnect. Verify actual served TLS and private readiness after renewal.
+
+Enable `certbot.timer` and test `certbot renew --dry-run --run-deploy-hooks`.
+The initial standalone HTTP-01 setup requires control-IP TCP port 80 to be
+reachable during renewal; this is unrelated to Broker-owned DNS-01 certificates.
