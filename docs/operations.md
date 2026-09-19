@@ -88,6 +88,18 @@ and reloads atomically. A failed renewal keeps a still-valid lineage only;
 expiry disables remote access. Run staging issuance and renewal with
 disposable names before enabling the production CA.
 
+Keep control servers and clients synchronized with NTP. Clients allow up to five
+seconds of positive server clock offset when checking future timestamps in
+authenticated bootstrap challenges, signed allocation receipts and scoped
+credential receipts. This narrow allowance covers ordinary subsecond clock and
+request timing differences; production bootstrap measurements were below 100 ms.
+It does not extend an expired challenge, credential or authorization claim, and
+it does not change the server's authorization lifetime checks. An allocation
+receipt issued slightly in the client's future is accepted only after its
+signature and operation, admin key, hostname and freshness bindings validate.
+Offsets approaching the allowance are an operational clock fault to alert on and
+correct, rather than a reason to increase the allowance.
+
 To move a live installation, provision the new gateway and its ingress
 addresses first. Run `bloom-relay-relocate INSTALLATION_UUID OPERATION_UUID
 PLACEMENT` from the restricted operator environment with

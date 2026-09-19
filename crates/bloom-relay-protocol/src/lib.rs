@@ -20,6 +20,9 @@ pub const STREAM_IDLE_SECS: u64 = 120;
 pub const STREAM_LIFETIME_SECS: u64 = 1800;
 pub const HEARTBEAT_SECS: u64 = 15;
 pub const DEAD_PEER_SECS: u64 = 45;
+/// Maximum tolerated positive server clock offset when a client validates a
+/// timestamp in an authenticated, trusted response. Expiration remains strict.
+pub const TRUSTED_RESPONSE_CLOCK_SKEW_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -166,8 +169,8 @@ impl AllocationReceipt {
         validate_hostname(&self.allocation.hostname)?;
         if self.operation_id != operation_id
             || self.admin_key_sha256 != sha256_hex(admin_public_key)
-            || self.issued_at_ms > now_ms
-            || now_ms - self.issued_at_ms > 300_000
+            || self.issued_at_ms > now_ms.saturating_add(TRUSTED_RESPONSE_CLOCK_SKEW_MS)
+            || now_ms.saturating_sub(self.issued_at_ms) > 300_000
         {
             return Err(ProtocolError::Unauthorized);
         }
@@ -524,6 +527,40 @@ mod tests {
         assert_eq!(
             receipt.verify(&key.verifying_key(), receipt.operation_id, &[7; 32], 1001),
             Err(ProtocolError::InvalidHostname)
+        );
+    }
+
+    #[test]
+    fn allocation_receipt_allows_only_bounded_future_clock_offset() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let now = 1_000_000;
+        let mut receipt = AllocationReceipt {
+            allocation: Allocation {
+                version: WIRE_VERSION,
+                installation_id: Uuid::new_v4(),
+                hostname: "abcdefghijklmnopqrstuv2345.relay.bloom.directory".into(),
+                placement: "shard-1".into(),
+                state: AllocationState::PendingDns,
+            },
+            operation_id: Uuid::new_v4(),
+            admin_key_sha256: sha256_hex(&[7; 32]),
+            issued_at_ms: now + TRUSTED_RESPONSE_CLOCK_SKEW_MS,
+            signature: String::new(),
+        };
+        receipt.signature =
+            URL_SAFE_NO_PAD.encode(key.sign(&receipt.signed_bytes().unwrap()).to_bytes());
+        assert!(
+            receipt
+                .verify(&key.verifying_key(), receipt.operation_id, &[7; 32], now)
+                .is_ok()
+        );
+
+        receipt.issued_at_ms += 1;
+        receipt.signature =
+            URL_SAFE_NO_PAD.encode(key.sign(&receipt.signed_bytes().unwrap()).to_bytes());
+        assert_eq!(
+            receipt.verify(&key.verifying_key(), receipt.operation_id, &[7; 32], now),
+            Err(ProtocolError::Unauthorized)
         );
     }
 }

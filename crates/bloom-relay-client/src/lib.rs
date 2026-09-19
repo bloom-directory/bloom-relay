@@ -3,7 +3,8 @@
 use bloom_relay_protocol::{
     CertificateMetadata, ChallengeLease, ControlDecoder, CredentialIssueReceipt,
     CredentialRenewRequest, DnsChallengeDeleteRequest, DnsChallengeRequest,
-    MAX_INSTALLATION_STREAMS, Scope, TunnelEvent, WIRE_VERSION, sha256_hex, validate_hostname,
+    MAX_INSTALLATION_STREAMS, Scope, TRUSTED_RESPONSE_CLOCK_SKEW_MS, TunnelEvent, WIRE_VERSION,
+    sha256_hex, validate_hostname,
 };
 use bytes::Bytes;
 use futures_util::future::poll_fn;
@@ -74,12 +75,12 @@ pub async fn renew_scoped_credential(
             .limit(16 * 1024)
             .read_json()
             .map_err(|_| ClientError::Transport)?;
+        let receipt_now = now_ms();
         if receipt.version != WIRE_VERSION
             || receipt.scope != scope
             || receipt.operation_id != operation_id
             || receipt.generation <= generation
-            || receipt.expires_at_ms <= now_ms()
-            || receipt.expires_at_ms > now_ms().saturating_add(86_400_000)
+            || !trusted_response_expiry(receipt.expires_at_ms, receipt_now, 86_400_000)
         {
             return Err(ClientError::Rejected);
         }
@@ -577,6 +578,14 @@ fn now_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
+fn trusted_response_expiry(expires_at_ms: u64, now_ms: u64, lifetime_ms: u64) -> bool {
+    expires_at_ms > now_ms
+        && expires_at_ms
+            <= now_ms
+                .saturating_add(lifetime_ms)
+                .saturating_add(TRUSTED_RESPONSE_CLOCK_SKEW_MS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,5 +607,22 @@ mod tests {
         };
         assert!(TunnelClient::new(config.clone(), "127.0.0.1:18734".parse().unwrap()).is_err());
         assert!(TunnelClient::new(config, CEREMONY_UPSTREAM).is_ok());
+    }
+
+    #[test]
+    fn credential_expiry_allows_only_bounded_future_clock_offset() {
+        let now = 1_000_000;
+        let lifetime = 86_400_000;
+        assert!(trusted_response_expiry(
+            now + lifetime + TRUSTED_RESPONSE_CLOCK_SKEW_MS,
+            now,
+            lifetime
+        ));
+        assert!(!trusted_response_expiry(
+            now + lifetime + TRUSTED_RESPONSE_CLOCK_SKEW_MS + 1,
+            now,
+            lifetime
+        ));
+        assert!(!trusted_response_expiry(now, now, lifetime));
     }
 }

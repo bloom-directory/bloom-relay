@@ -4,7 +4,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bloom_relay_protocol::{
     AcmeAccountRequest, AllocateRequest, Allocation, AllocationReceipt, AuthClaims,
     BootstrapChallenge, CredentialIssueReceipt, CredentialIssueRequest, InstallationStatusRequest,
-    RetireRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex, validate_hostname,
+    RetireRequest, Scope, SignedRequest, TRUSTED_RESPONSE_CLOCK_SKEW_MS, WIRE_VERSION, sha256_hex,
+    validate_hostname,
 };
 use rand::{RngCore, rngs::OsRng};
 use std::{
@@ -81,9 +82,7 @@ where
         return Err(EnrollmentError::IncompatibleProtocol);
     }
     let now = now_ms();
-    if challenge.expires_at_ms <= now
-        || challenge.expires_at_ms > now.saturating_add(60_000)
-        || challenge.nonce.len() != 43
+    if !trusted_response_expiry(challenge.expires_at_ms, now, 60_000) || challenge.nonce.len() != 43
     {
         return Err(EnrollmentError::Rejected);
     }
@@ -183,12 +182,12 @@ where
             .send_json(&request)
             .map_err(|_| EnrollmentError::Unavailable)?,
     )?;
+    let receipt_now = now_ms();
     if receipt.version != WIRE_VERSION
         || receipt.scope != scope
         || receipt.operation_id != operation_id
         || receipt.generation == 0
-        || receipt.expires_at_ms <= now_ms()
-        || receipt.expires_at_ms > now_ms().saturating_add(86_400_000)
+        || !trusted_response_expiry(receipt.expires_at_ms, receipt_now, 86_400_000)
     {
         return Err(EnrollmentError::InvalidReceipt);
     }
@@ -370,4 +369,34 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn trusted_response_expiry(expires_at_ms: u64, now_ms: u64, lifetime_ms: u64) -> bool {
+    expires_at_ms > now_ms
+        && expires_at_ms
+            <= now_ms
+                .saturating_add(lifetime_ms)
+                .saturating_add(TRUSTED_RESPONSE_CLOCK_SKEW_MS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_response_expiry_allows_only_bounded_future_clock_offset() {
+        let now = 1_000_000;
+        let lifetime = 60_000;
+        assert!(trusted_response_expiry(
+            now + lifetime + TRUSTED_RESPONSE_CLOCK_SKEW_MS,
+            now,
+            lifetime
+        ));
+        assert!(!trusted_response_expiry(
+            now + lifetime + TRUSTED_RESPONSE_CLOCK_SKEW_MS + 1,
+            now,
+            lifetime
+        ));
+        assert!(!trusted_response_expiry(now, now, lifetime));
+    }
 }
