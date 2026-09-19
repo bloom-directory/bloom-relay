@@ -1,6 +1,6 @@
 //! Exact-owner DNS changes; provider credentials remain in the control worker.
 
-use bloom_relay_protocol::{ProtocolError, validate_hostname};
+use bloom_relay_protocol::{ProtocolError, validate_acme_account_uri, validate_hostname};
 use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -70,9 +70,7 @@ pub fn validate_records(records: &NameRecords) -> Result<(), DnsError> {
     if records.addresses.is_empty()
         || records.addresses.len() > 4
         || records.addresses.iter().any(IpAddr::is_unspecified)
-        || !records
-            .acme_account_uri
-            .starts_with("https://acme-v02.api.letsencrypt.org/acme/acct/")
+        || validate_acme_account_uri(&records.acme_account_uri).is_err()
     {
         return Err(DnsError::InvalidChange);
     }
@@ -80,11 +78,7 @@ pub fn validate_records(records: &NameRecords) -> Result<(), DnsError> {
 }
 
 pub fn caa_values(acme_account_uri: &str) -> Result<[String; 2], DnsError> {
-    if !acme_account_uri.starts_with("https://acme-v02.api.letsencrypt.org/acme/acct/")
-        || !acme_account_uri["https://acme-v02.api.letsencrypt.org/acme/acct/".len()..]
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-    {
+    if validate_acme_account_uri(acme_account_uri).is_err() {
         return Err(DnsError::InvalidChange);
     }
     Ok([
@@ -228,5 +222,41 @@ mod tests {
         assert!(dns.txt(host).await.is_some());
         dns.retire_challenge(host).await.unwrap();
         assert!(dns.txt(host).await.is_none());
+    }
+
+    #[test]
+    fn caa_binds_exact_known_production_and_staging_accounts() {
+        for account in [
+            "https://acme-v02.api.letsencrypt.org/acme/acct/123",
+            "https://acme-staging-v02.api.letsencrypt.org/acme/acct/456",
+        ] {
+            assert_eq!(
+                caa_values(account).unwrap(),
+                [
+                    format!(
+                        "0 issue \"letsencrypt.org; validationmethods=dns-01; accounturi={account}\""
+                    ),
+                    "0 issuewild \";\"".to_owned(),
+                ]
+            );
+        }
+        for invalid in [
+            "https://example.com/acme/acct/123",
+            "https://acme-staging-v02.api.letsencrypt.org/acme/acct/",
+            "https://acme-staging-v02.api.letsencrypt.org/acme/acct/123?other=true",
+        ] {
+            assert!(caa_values(invalid).is_err(), "{invalid}");
+        }
+        let overlong = format!(
+            "{}{}",
+            bloom_relay_protocol::AcmeEnvironment::Staging.account_uri_prefix(),
+            "1".repeat(
+                bloom_relay_protocol::MAX_ACME_ACCOUNT_URI_LEN + 1
+                    - bloom_relay_protocol::AcmeEnvironment::Staging
+                        .account_uri_prefix()
+                        .len()
+            )
+        );
+        assert!(caa_values(&overlong).is_err());
     }
 }

@@ -7,10 +7,11 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bloom_relay_protocol::{
-    AcmeAccountRequest, AllocateRequest, Allocation, AllocationReceipt, BootstrapChallenge,
-    CertificateMetadata, CredentialIssueReceipt, CredentialIssueRequest, CredentialRenewRequest,
-    DnsChallengeDeleteRequest, DnsChallengeRequest, ErrorCode, ErrorEnvelope,
-    InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex,
+    AcmeAccountRequest, AcmeEnvironment, AllocateRequest, Allocation, AllocationReceipt,
+    BootstrapChallenge, CertificateMetadata, CredentialIssueReceipt, CredentialIssueRequest,
+    CredentialRenewRequest, DnsChallengeDeleteRequest, DnsChallengeRequest, ErrorCode,
+    ErrorEnvelope, InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION,
+    sha256_hex,
 };
 use bloom_relay_store::{DnsJobScope, RestoreWitness, Store};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -62,6 +63,28 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn parse_acme_environment(
+    configured: Option<&str>,
+) -> Result<AcmeEnvironment, bloom_relay_protocol::ProtocolError> {
+    configured.unwrap_or("production").parse()
+}
+
+fn configured_acme_environment() -> Result<AcmeEnvironment, bloom_relay_protocol::ProtocolError> {
+    acme_environment_from_env(env::var("BLOOM_RELAY_ACME_ENVIRONMENT"))
+}
+
+fn acme_environment_from_env(
+    configured: Result<String, env::VarError>,
+) -> Result<AcmeEnvironment, bloom_relay_protocol::ProtocolError> {
+    match configured {
+        Ok(value) => parse_acme_environment(Some(&value)),
+        Err(env::VarError::NotPresent) => parse_acme_environment(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(bloom_relay_protocol::ProtocolError::InvalidAcmeEnvironment)
+        }
+    }
 }
 
 #[tokio::main]
@@ -125,12 +148,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .try_into()
         .map_err(|_| "receipt key must be 32 raw bytes")?;
     let witness_path = env::var("BLOOM_RELAY_RESTORE_WITNESS_PATH")?;
+    let acme_environment = configured_acme_environment()?;
     let state = Arc::new(AppState {
         store: Store::connect_runtime_with_witness(
             &env::var("BLOOM_RELAY_DATABASE_URL")?,
             witness_path.clone().into(),
         )
-        .await?,
+        .await?
+        .with_acme_environment(acme_environment),
         receipt_key: SigningKey::from_bytes(&key_bytes),
         audience,
         placement,
@@ -721,6 +746,28 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[test]
+    fn acme_environment_configuration_is_strict_and_defaults_to_production() {
+        assert_eq!(
+            parse_acme_environment(None),
+            Ok(AcmeEnvironment::Production)
+        );
+        assert_eq!(
+            parse_acme_environment(Some("production")),
+            Ok(AcmeEnvironment::Production)
+        );
+        assert_eq!(
+            parse_acme_environment(Some("staging")),
+            Ok(AcmeEnvironment::Staging)
+        );
+        for invalid in ["", "STAGING", "development", "staging "] {
+            assert!(parse_acme_environment(Some(invalid)).is_err(), "{invalid}");
+        }
+        assert!(
+            acme_environment_from_env(Err(env::VarError::NotUnicode("staging".into()))).is_err()
+        );
+    }
 
     fn signed<T: serde::Serialize>(
         installation_id: Uuid,

@@ -1,6 +1,8 @@
 //! PostgreSQL authority for durable relay identity, tombstones and generations.
 
-use bloom_relay_protocol::{Allocation, AllocationState, ChallengeLease, WIRE_VERSION};
+use bloom_relay_protocol::{
+    AcmeEnvironment, Allocation, AllocationState, ChallengeLease, WIRE_VERSION,
+};
 use data_encoding::BASE32_NOPAD;
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
@@ -34,6 +36,7 @@ pub enum StoreError {
 pub struct Store {
     pool: PgPool,
     witness: Option<Arc<RestoreWitness>>,
+    acme_environment: AcmeEnvironment,
 }
 
 #[derive(Debug)]
@@ -69,6 +72,7 @@ impl Store {
         Ok(Self {
             pool,
             witness: None,
+            acme_environment: AcmeEnvironment::Production,
         })
     }
 
@@ -111,6 +115,7 @@ impl Store {
                 RestoreWitness::new(path)
                     .map_err(|error| StoreError::Witness(error.to_string()))?,
             )),
+            acme_environment: AcmeEnvironment::Production,
         };
         store.acknowledge().await?;
         Ok(store)
@@ -132,6 +137,13 @@ impl Store {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Restricts future ACME account registration to one reviewed Let's Encrypt
+    /// environment. Existing owner-bound rows remain readable by runtime workers.
+    pub fn with_acme_environment(mut self, environment: AcmeEnvironment) -> Self {
+        self.acme_environment = environment;
+        self
     }
 
     pub async fn restore_revision(&self) -> Result<u64, StoreError> {
@@ -376,10 +388,10 @@ impl Store {
         installation_id: Uuid,
         account_uri: &str,
     ) -> Result<(), StoreError> {
-        if !account_uri.starts_with("https://acme-v02.api.letsencrypt.org/acme/acct/")
-            || !account_uri["https://acme-v02.api.letsencrypt.org/acme/acct/".len()..]
-                .bytes()
-                .all(|b| b.is_ascii_digit())
+        if self
+            .acme_environment
+            .validate_account_uri(account_uri)
+            .is_err()
         {
             return Err(StoreError::InvalidRequest);
         }

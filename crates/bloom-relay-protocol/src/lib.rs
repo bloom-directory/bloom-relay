@@ -4,6 +4,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -23,6 +24,62 @@ pub const DEAD_PEER_SECS: u64 = 45;
 /// Maximum tolerated positive server clock offset when a client validates a
 /// timestamp in an authenticated, trusted response. Expiration remains strict.
 pub const TRUSTED_RESPONSE_CLOCK_SKEW_MS: u64 = 5_000;
+/// Keeps the account-bound CAA value within its 255-octet DNS field limit.
+pub const MAX_ACME_ACCOUNT_URI_LEN: usize = 200;
+
+const ACME_PRODUCTION_ACCOUNT_PREFIX: &str = "https://acme-v02.api.letsencrypt.org/acme/acct/";
+const ACME_STAGING_ACCOUNT_PREFIX: &str = "https://acme-staging-v02.api.letsencrypt.org/acme/acct/";
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeEnvironment {
+    #[default]
+    Production,
+    Staging,
+}
+
+impl AcmeEnvironment {
+    pub fn account_uri_prefix(self) -> &'static str {
+        match self {
+            Self::Production => ACME_PRODUCTION_ACCOUNT_PREFIX,
+            Self::Staging => ACME_STAGING_ACCOUNT_PREFIX,
+        }
+    }
+
+    pub fn validate_account_uri(self, account_uri: &str) -> Result<(), ProtocolError> {
+        if account_uri.len() > MAX_ACME_ACCOUNT_URI_LEN {
+            return Err(ProtocolError::InvalidAcmeAccountUri);
+        }
+        let Some(account_id) = account_uri.strip_prefix(self.account_uri_prefix()) else {
+            return Err(ProtocolError::InvalidAcmeAccountUri);
+        };
+        if account_id.is_empty() || !account_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ProtocolError::InvalidAcmeAccountUri);
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for AcmeEnvironment {
+    type Err = ProtocolError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "production" => Ok(Self::Production),
+            "staging" => Ok(Self::Staging),
+            _ => Err(ProtocolError::InvalidAcmeEnvironment),
+        }
+    }
+}
+
+pub fn validate_acme_account_uri(account_uri: &str) -> Result<AcmeEnvironment, ProtocolError> {
+    for environment in [AcmeEnvironment::Production, AcmeEnvironment::Staging] {
+        if environment.validate_account_uri(account_uri).is_ok() {
+            return Ok(environment);
+        }
+    }
+    Err(ProtocolError::InvalidAcmeAccountUri)
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -372,6 +429,10 @@ pub enum ProtocolError {
     InvalidSignature,
     #[error("invalid hostname")]
     InvalidHostname,
+    #[error("invalid ACME environment")]
+    InvalidAcmeEnvironment,
+    #[error("invalid ACME account URI")]
+    InvalidAcmeAccountUri,
 }
 
 pub fn validate_hostname(hostname: &str) -> Result<(), ProtocolError> {
@@ -467,6 +528,52 @@ mod tests {
         ] {
             assert!(validate_hostname(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn acme_environment_accepts_only_its_exact_account_uri_namespace() {
+        let production = "https://acme-v02.api.letsencrypt.org/acme/acct/123";
+        let staging = "https://acme-staging-v02.api.letsencrypt.org/acme/acct/456";
+        assert_eq!(
+            validate_acme_account_uri(production),
+            Ok(AcmeEnvironment::Production)
+        );
+        assert_eq!(
+            validate_acme_account_uri(staging),
+            Ok(AcmeEnvironment::Staging)
+        );
+        assert!(
+            AcmeEnvironment::Production
+                .validate_account_uri(staging)
+                .is_err()
+        );
+        assert!(
+            AcmeEnvironment::Staging
+                .validate_account_uri(production)
+                .is_err()
+        );
+        for invalid in [
+            "https://acme-v02.api.letsencrypt.org/acme/acct/",
+            "https://acme-v02.api.letsencrypt.org/acme/acct/123/",
+            "https://acme-v02.api.letsencrypt.org/acme/acct/12x",
+            "https://example.com/acme/acct/123",
+            "http://acme-v02.api.letsencrypt.org/acme/acct/123",
+        ] {
+            assert!(validate_acme_account_uri(invalid).is_err(), "{invalid}");
+        }
+        let overlong = format!(
+            "{}{}",
+            AcmeEnvironment::Production.account_uri_prefix(),
+            "1".repeat(
+                MAX_ACME_ACCOUNT_URI_LEN + 1
+                    - AcmeEnvironment::Production.account_uri_prefix().len()
+            )
+        );
+        assert_eq!(overlong.len(), MAX_ACME_ACCOUNT_URI_LEN + 1);
+        assert!(validate_acme_account_uri(&overlong).is_err());
+        assert_eq!("production".parse(), Ok(AcmeEnvironment::Production));
+        assert_eq!("staging".parse(), Ok(AcmeEnvironment::Staging));
+        assert!("STAGING".parse::<AcmeEnvironment>().is_err());
     }
 
     #[test]

@@ -78,6 +78,16 @@ relay names that have no exact per-installation CAA. Do not put this policy at
 authority to modify the parent policy. Confirm authoritative and recursive CAA
 answers before enrollment and after a retirement.
 
+The control API defaults to Let's Encrypt production account registration.
+Set `BLOOM_RELAY_ACME_ENVIRONMENT=staging` only for an explicitly reviewed
+staging issuance exercise while enrollment is closed, and allocate a fresh test
+installation rather than rebinding an existing hostname. The only accepted
+values are `production` and `staging`; any other value fails startup. Registration
+accepts only the selected Let's Encrypt account URI namespace with a numeric
+account ID. DNS reconciliation accepts those two validated namespaces so it can
+publish the exact account-bound CAA record during a controlled test-mode switch;
+the exact-owner `issuewild ";"` denial remains present.
+
 Deployment acceptance must exercise authoritative and recursive
 A/AAAA/CAA/TXT resolution, unknown-name NXDOMAIN, IPv4/IPv6 ingress,
 placement move with stable RP, and provider change timeout/ambiguous-write

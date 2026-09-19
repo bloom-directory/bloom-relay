@@ -1,4 +1,4 @@
-use bloom_relay_protocol::{CertificateMetadata, ChallengeLease};
+use bloom_relay_protocol::{AcmeEnvironment, CertificateMetadata, ChallengeLease};
 use bloom_relay_store::{DnsJobScope, RestoreWitness, Store, StoreError, WitnessError};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -182,6 +182,82 @@ async fn allocation_rotation_dns_and_fencing() {
             .await
             .unwrap();
     assert_eq!(reserved, 1);
+}
+
+#[tokio::test]
+async fn acme_registration_is_restricted_to_configured_environment() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let production = Store::connect(&url).await.unwrap();
+    let staging = production
+        .clone()
+        .with_acme_environment(AcmeEnvironment::Staging);
+    let production_uri = "https://acme-v02.api.letsencrypt.org/acme/acct/123";
+    let staging_uri = "https://acme-staging-v02.api.letsencrypt.org/acme/acct/456";
+
+    let production_id = production
+        .allocate(Uuid::new_v4(), [21; 32], "test-shard")
+        .await
+        .unwrap()
+        .installation_id;
+    production
+        .register_acme_account(production_id, production_uri)
+        .await
+        .unwrap();
+    assert!(matches!(
+        production
+            .register_acme_account(production_id, staging_uri)
+            .await,
+        Err(StoreError::InvalidRequest)
+    ));
+    assert_eq!(
+        production
+            .dns_identity(production_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        production_uri
+    );
+
+    let staging_id = staging
+        .allocate(Uuid::new_v4(), [22; 32], "test-shard")
+        .await
+        .unwrap()
+        .installation_id;
+    staging
+        .register_acme_account(staging_id, staging_uri)
+        .await
+        .unwrap();
+    assert!(matches!(
+        staging
+            .register_acme_account(staging_id, production_uri)
+            .await,
+        Err(StoreError::InvalidRequest)
+    ));
+    assert!(matches!(
+        staging
+            .register_acme_account(staging_id, "https://example.com/acme/acct/456")
+            .await,
+        Err(StoreError::InvalidRequest)
+    ));
+    let overlong = format!(
+        "{}{}",
+        AcmeEnvironment::Staging.account_uri_prefix(),
+        "1".repeat(
+            bloom_relay_protocol::MAX_ACME_ACCOUNT_URI_LEN + 1
+                - AcmeEnvironment::Staging.account_uri_prefix().len()
+        )
+    );
+    assert!(matches!(
+        staging.register_acme_account(staging_id, &overlong).await,
+        Err(StoreError::InvalidRequest)
+    ));
+    assert_eq!(
+        staging.dns_identity(staging_id).await.unwrap().unwrap().1,
+        staging_uri
+    );
 }
 
 #[tokio::test]
