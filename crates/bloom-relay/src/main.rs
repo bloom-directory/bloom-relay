@@ -362,6 +362,18 @@ async fn control_connection(
                         .store
                         .tunnel_is_current(ticket.id, &gateway.gateway_id, ticket.generation)
                         .await?;
+                #[cfg(test)]
+                if !valid {
+                    eprintln!(
+                        "rejected CONNECT: same_tunnel={same_tunnel} authority={:?} expected={} expired={} active={:?}",
+                        request.uri().authority(),
+                        ticket.host,
+                        ticket.deadline <= Instant::now(),
+                        active
+                            .as_ref()
+                            .map(|(host, tunnel)| (host, tunnel.id, tunnel.generation)),
+                    );
+                }
                 if valid {
                     let outbound = response.send_response(
                         Response::builder().status(StatusCode::OK).body(())?,
@@ -553,7 +565,25 @@ mod tests {
     use proptest::prelude::*;
     use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
     use sha2::{Digest, Sha256};
+    use std::process::{Child, Command, Stdio};
     use tokio::sync::watch;
+
+    struct DockerHaproxy {
+        child: Child,
+        name: String,
+    }
+
+    impl Drop for DockerHaproxy {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .args(["rm", "--force", &self.name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 
     #[tokio::test]
     async fn fragmented_client_hello_extracts_exact_sni_and_preserves_bytes() {
@@ -696,10 +726,22 @@ mod tests {
         let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
             return;
         };
+        run_opaque_tls_fixture(&url, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker, haproxy:3.2-alpine, and BLOOM_RELAY_TEST_DATABASE_URL"]
+    async fn haproxy_h2_preserves_tunnel_connection_binding() {
+        let url = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL")
+            .expect("BLOOM_RELAY_TEST_DATABASE_URL must name a disposable database");
+        run_opaque_tls_fixture(&url, true).await;
+    }
+
+    async fn run_opaque_tls_fixture(url: &str, through_haproxy: bool) {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        let store = Store::connect(&url).await.unwrap();
+        let store = Store::connect(url).await.unwrap();
         let allocation = store
             .allocate(Uuid::new_v4(), [7u8; 32], "fixture")
             .await
@@ -716,19 +758,48 @@ mod tests {
             .issue_bearer(id, Uuid::new_v4(), "tunnel", hash, 3600)
             .await
             .unwrap();
-        let certificate = rcgen::generate_simple_self_signed(vec![
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Bloom Relay Test CA");
+        ca_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::KeyCertSign);
+        ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+        let ca =
+            rcgen::CertifiedIssuer::self_signed(ca_params, rcgen::KeyPair::generate().unwrap())
+                .unwrap();
+        let signing_key = rcgen::KeyPair::generate().unwrap();
+        let mut certificate_params = rcgen::CertificateParams::new(vec![
             "relay-control.bloom.directory".into(),
             allocation.hostname.clone(),
         ])
         .unwrap();
+        certificate_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "relay-control.bloom.directory");
+        certificate_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::DigitalSignature);
+        certificate_params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+        let certificate = certificate_params.signed_by(&signing_key, &ca).unwrap();
         let fixture = std::env::temp_dir().join(format!("bloom-relay-tls-{}", Uuid::new_v4()));
         std::fs::create_dir(&fixture).unwrap();
         let cert_path = fixture.join("cert.pem").to_string_lossy().to_string();
         let key_path = fixture.join("key.pem").to_string_lossy().to_string();
-        std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
-        std::fs::write(&key_path, certificate.signing_key.serialize_pem()).unwrap();
+        let ca_path = fixture.join("ca.pem").to_string_lossy().to_string();
+        let haproxy_pem_path = fixture.join("haproxy.pem").to_string_lossy().to_string();
+        let fullchain = format!("{}{}", certificate.pem(), ca.pem());
+        let key = signing_key.serialize_pem();
+        std::fs::write(&cert_path, &fullchain).unwrap();
+        std::fs::write(&key_path, &key).unwrap();
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        std::fs::write(&haproxy_pem_path, format!("{fullchain}{key}")).unwrap();
         let mut roots = RootCertStore::empty();
-        let cert = CertificateDer::pem_file_iter(&cert_path)
+        let cert = CertificateDer::pem_file_iter(&ca_path)
             .unwrap()
             .next()
             .unwrap()
@@ -748,7 +819,13 @@ mod tests {
                 MAX_GATEWAY_STREAMS.min(BUFFER_BUDGET / (2 * BUFFER_PER_DIRECTION)),
             )),
         });
-        let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = TcpListener::bind(if through_haproxy {
+            "0.0.0.0:0"
+        } else {
+            "127.0.0.1:0"
+        })
+        .await
+        .unwrap();
         let ingress = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let control_address = control.local_addr().unwrap();
         let ingress_address = ingress.local_addr().unwrap();
@@ -764,6 +841,98 @@ mod tests {
                 });
             }
         });
+        let mut haproxy = None;
+        let client_control_address = if through_haproxy {
+            let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let frontend_port = reserved.local_addr().unwrap().port();
+            drop(reserved);
+            let config_path = fixture.join("haproxy.cfg");
+            std::fs::write(
+                &config_path,
+                format!(
+                    r#"global
+    log stdout format raw local0
+
+defaults
+    mode http
+    log global
+    option httplog
+    option logasap
+    timeout connect 2s
+    timeout client 30s
+    timeout server 30s
+    timeout tunnel 30s
+
+frontend relay_control
+    bind :8443 ssl crt /fixture/haproxy.pem alpn h2
+    acl tunnel_open path -i /v1/tunnel
+    acl tunnel_attach method CONNECT
+    use_backend relay_tunnel if tunnel_open
+    use_backend relay_tunnel if tunnel_attach
+    default_backend reject
+
+backend relay_tunnel
+    server gateway host.docker.internal:{} ssl verify required ca-file /fixture/ca.pem verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2
+
+backend reject
+    http-request deny deny_status 404
+"#,
+                    control_address.port()
+                ),
+            )
+            .unwrap();
+            let name = format!("bloom-relay-haproxy-{}", Uuid::new_v4());
+            let mount = format!("{}:/fixture:ro", fixture.to_string_lossy());
+            let publish = format!("127.0.0.1:{frontend_port}:8443");
+            let child = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--name",
+                    &name,
+                    "--add-host",
+                    "host.docker.internal:host-gateway",
+                    "--publish",
+                    &publish,
+                    "--volume",
+                    &mount,
+                    "haproxy:3.2-alpine",
+                    "haproxy",
+                    "-db",
+                    "-f",
+                    "/fixture/haproxy.cfg",
+                ])
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("start disposable HAProxy 3.2 container");
+            haproxy = Some(DockerHaproxy { child, name });
+            let address = SocketAddr::from(([127, 0, 0, 1], frontend_port));
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(tcp) = TcpStream::connect(address).await
+                        && tokio_rustls::TlsConnector::from(client_tls.clone())
+                            .connect(
+                                ServerName::try_from("relay-control.bloom.directory").unwrap(),
+                                tcp,
+                            )
+                            .await
+                            .is_ok()
+                    {
+                        break;
+                    }
+                    if let Some(status) = haproxy.as_mut().unwrap().child.try_wait().unwrap() {
+                        panic!("HAProxy container exited before accepting connections: {status}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("HAProxy did not start within 10 seconds");
+            address
+        } else {
+            control_address
+        };
         let ingress_gateway = gateway.clone();
         let ingress_task = tokio::spawn(async move {
             loop {
@@ -794,7 +963,7 @@ mod tests {
                 .unwrap();
         }
         let config = TunnelConfig {
-            gateway: control_address,
+            gateway: client_control_address,
             control_server_name: "relay-control.bloom.directory".into(),
             hostname: allocation.hostname.clone(),
             installation_id: id,
@@ -803,7 +972,7 @@ mod tests {
         };
         let (ready, mut watched) = watch::channel(false);
         let (stop, stopped) = oneshot::channel::<()>();
-        let first = tokio::spawn(
+        let mut first = tokio::spawn(
             TunnelClient::new(config.clone(), CEREMONY_UPSTREAM)
                 .unwrap()
                 .run_until_ready(
@@ -813,11 +982,18 @@ mod tests {
                     ready,
                 ),
         );
-        timeout(Duration::from_secs(5), watched.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(*watched.borrow());
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                changed = watched.changed() => changed.unwrap(),
+                result = &mut first => panic!("first tunnel stopped before readiness: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        if !*watched.borrow() {
+            let result = timeout(Duration::from_secs(1), &mut first).await;
+            panic!("first tunnel lost readiness immediately: {result:?}");
+        }
         let first_generation = gateway
             .tunnels
             .lock()
@@ -829,7 +1005,7 @@ mod tests {
         let mut browser_tls = ClientConfig::builder()
             .with_root_certificates({
                 let mut roots = RootCertStore::empty();
-                let cert = CertificateDer::pem_file_iter(&cert_path)
+                let cert = CertificateDer::pem_file_iter(&ca_path)
                     .unwrap()
                     .next()
                     .unwrap()
@@ -858,7 +1034,7 @@ mod tests {
 
         let (ready_second, mut watched_second) = watch::channel(false);
         let (stop_second, stopped_second) = oneshot::channel::<()>();
-        let second = tokio::spawn(
+        let mut second = tokio::spawn(
             TunnelClient::new(config, CEREMONY_UPSTREAM)
                 .unwrap()
                 .run_until_ready(
@@ -868,10 +1044,18 @@ mod tests {
                     ready_second,
                 ),
         );
-        timeout(Duration::from_secs(5), watched_second.changed())
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                changed = watched_second.changed() => changed.unwrap(),
+                result = &mut second => panic!("second tunnel stopped before readiness: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        if !*watched_second.borrow() {
+            let result = timeout(Duration::from_secs(1), &mut second).await;
+            panic!("second tunnel lost readiness immediately: {result:?}");
+        }
         let second_generation = gateway
             .tunnels
             .lock()
@@ -898,6 +1082,7 @@ mod tests {
         second.await.unwrap().unwrap();
         control_task.abort();
         ingress_task.abort();
+        drop(haproxy);
         std::fs::remove_file(credential_path).unwrap();
         std::fs::remove_dir_all(fixture).unwrap();
     }
