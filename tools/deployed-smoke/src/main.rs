@@ -78,7 +78,10 @@ async fn main() -> Result<()> {
         allocation.installation_id, allocation.hostname
     );
 
-    let result = run_enrolled(&inputs, &admin_key, &allocation, &temp, listener).await;
+    let result = tokio::select! {
+        result = run_enrolled(&inputs, &admin_key, &allocation, &temp, listener) => result,
+        result = shutdown_signal() => result.and_then(|()| Err(anyhow!("probe interrupted; retiring allocation"))),
+    };
     let retirement = retire_installation(
         enrollment_config(&inputs),
         allocation.installation_id,
@@ -96,6 +99,15 @@ async fn main() -> Result<()> {
     result?;
     retirement.context("retirement failed")?;
     Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("cannot register probe termination handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("probe interrupt handler failed"),
+        _ = terminate.recv() => Ok(()),
+    }
 }
 
 async fn run_enrolled(

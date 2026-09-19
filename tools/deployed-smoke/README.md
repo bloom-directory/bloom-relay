@@ -34,3 +34,9 @@ same reviewed client code as the deployed release.
 The public receipt key and ACME account URI may instead be supplied directly as
 `BLOOM_RELAY_SMOKE_RECEIPT_PUBLIC_KEY_HEX` and
 `BLOOM_RELAY_SMOKE_ACME_ACCOUNT_URI`. Set exactly one source for each value.
+
+After enrollment, SIGINT or SIGTERM cancels the probe and attempts signed
+retirement before exit, preserving the normal DNS-cleanup outbox and permanent
+tombstone. Check the retirement result and worker cleanup afterward. A forced
+kill, process crash or ambiguous enrollment response cannot guarantee cleanup;
+the ephemeral administrator key is intentionally not persisted.
