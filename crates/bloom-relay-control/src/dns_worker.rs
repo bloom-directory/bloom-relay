@@ -59,7 +59,7 @@ impl DnsWorker {
 
     pub async fn run(self) {
         loop {
-            if let Ok(Some(seconds)) = sqlx::query_scalar::<_, Option<f64>>("SELECT max(extract(epoch FROM now()-o.next_attempt_at)) FROM outbox o JOIN installations i USING (installation_id) WHERE o.completed_at IS NULL AND i.placement=$1 AND (($2='serving' AND o.kind IN ('publish_name','remove_records')) OR ($2='challenge' AND o.kind IN ('publish_txt','remove_txt','remove_txt_all')))")
+            if let Ok(Some(seconds)) = sqlx::query_scalar::<_, Option<f64>>("SELECT max(extract(epoch FROM now()-o.next_attempt_at))::double precision FROM outbox o JOIN installations i USING (installation_id) WHERE o.completed_at IS NULL AND i.placement=$1 AND (($2='serving' AND o.kind IN ('publish_name','remove_records')) OR ($2='challenge' AND o.kind IN ('publish_txt','remove_txt','remove_txt_all')))")
                 .bind(&self.placement).bind(self.scope.as_str()).fetch_one(self.store.pool()).await {
                 bloom_relay_observe::gauge("bloom_relay_dns_job_lag_seconds", seconds.max(0.0));
             }

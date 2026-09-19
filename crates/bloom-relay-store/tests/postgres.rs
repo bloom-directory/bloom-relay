@@ -261,6 +261,146 @@ async fn abandoned_pending_and_challenge_leases_are_swept_without_reuse() {
     assert_eq!(jobs, 1);
 }
 
+#[tokio::test]
+async fn challenge_jobs_decode_active_expired_and_deleted_leases() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+    let allocation = store
+        .allocate(Uuid::new_v4(), [5u8; 32], "challenge-job-test")
+        .await
+        .unwrap();
+    let id = allocation.installation_id;
+    store
+        .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+        .await
+        .unwrap();
+    store.mark_dns_ready(id).await.unwrap();
+    let token_hash: [u8; 32] = Sha256::digest(b"challenge-job-token").into();
+    let (generation, _) = store
+        .issue_bearer(id, Uuid::new_v4(), "dns_challenge", token_hash, 3600)
+        .await
+        .unwrap();
+
+    let expired_id = Uuid::new_v4();
+    let expiry = now_ms() + 600_000;
+    store
+        .create_challenge(
+            id,
+            generation,
+            &ChallengeLease {
+                operation_id: expired_id,
+                txt_value: "e".repeat(43),
+                expires_at_ms: expiry,
+            },
+        )
+        .await
+        .unwrap();
+    let active = store
+        .challenge_for_job(id, expired_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.operation_id, expired_id);
+    assert_eq!(active.txt_value, "e".repeat(43));
+    assert!(active.expires_at_ms.abs_diff(expiry) <= 1);
+
+    sqlx::query("UPDATE challenge_leases SET expires_at=now()-interval '1 second' WHERE installation_id=$1 AND lease_id=$2")
+        .bind(id).bind(expired_id).execute(store.pool()).await.unwrap();
+    assert!(
+        store
+            .challenge_for_job(id, expired_id, false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let expired_cleanup = store
+        .challenge_for_job(id, expired_id, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired_cleanup.operation_id, expired_id);
+    assert_eq!(expired_cleanup.txt_value, "e".repeat(43));
+
+    let deleted_id = Uuid::new_v4();
+    store
+        .create_challenge(
+            id,
+            generation,
+            &ChallengeLease {
+                operation_id: deleted_id,
+                txt_value: "d".repeat(43),
+                expires_at_ms: now_ms() + 600_000,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .challenge_for_job(id, expired_id, true)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store
+        .delete_challenge(id, generation, deleted_id)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .challenge_for_job(id, deleted_id, false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let deleted_cleanup = store
+        .challenge_for_job(id, deleted_id, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted_cleanup.operation_id, deleted_id);
+    assert_eq!(deleted_cleanup.txt_value, "d".repeat(43));
+}
+
+#[tokio::test]
+async fn epoch_metric_aggregates_decode_empty_and_populated_results_as_f64() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+
+    let empty_min: Option<f64> = sqlx::query_scalar(
+        "SELECT min(value)::double precision FROM (SELECT extract(epoch FROM now()-now()) AS value WHERE false) values",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let empty_max: Option<f64> = sqlx::query_scalar(
+        "SELECT max(value)::double precision FROM (SELECT extract(epoch FROM now()-now()) AS value WHERE false) values",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(empty_min, None);
+    assert_eq!(empty_max, None);
+
+    let value_min: Option<f64> = sqlx::query_scalar(
+        "SELECT min(value)::double precision FROM (VALUES (1::numeric), (2::numeric)) values(value)",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let value_max: Option<f64> = sqlx::query_scalar(
+        "SELECT max(value)::double precision FROM (VALUES (1::numeric), (2::numeric)) values(value)",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(value_min, Some(1.0));
+    assert_eq!(value_max, Some(2.0));
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

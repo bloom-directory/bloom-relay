@@ -551,12 +551,16 @@ impl Store {
                 return Ok(None);
             }
         }
-        let row = sqlx::query("SELECT txt_value,extract(epoch FROM expires_at)*1000 AS expiry FROM challenge_leases WHERE installation_id=$1 AND lease_id=$2 AND ($3 OR (deleted_at IS NULL AND expires_at>now()))")
+        let row = sqlx::query("SELECT txt_value,(extract(epoch FROM expires_at)*1000)::bigint AS expiry FROM challenge_leases WHERE installation_id=$1 AND lease_id=$2 AND ($3 OR (deleted_at IS NULL AND expires_at>now()))")
             .bind(installation_id).bind(lease_id).bind(cleanup).fetch_optional(&self.pool).await?;
-        Ok(row.map(|row| ChallengeLease {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let expiry: i64 = row.try_get("expiry")?;
+        Ok(Some(ChallengeLease {
             operation_id: lease_id,
-            txt_value: row.get("txt_value"),
-            expires_at_ms: row.get::<f64, _>("expiry") as u64,
+            txt_value: row.try_get("txt_value")?,
+            expires_at_ms: expiry.try_into().map_err(|_| StoreError::InvalidRequest)?,
         }))
     }
 

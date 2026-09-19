@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tracing::warn!(%error, "challenge lease sweep failed");
             }
             if let Ok(Some(seconds)) = sqlx::query_scalar::<_, Option<f64>>(
-                "SELECT min(extract(epoch FROM not_after-now())) FROM certificate_inventory",
+                "SELECT min(extract(epoch FROM not_after-now()))::double precision FROM certificate_inventory",
             )
             .fetch_one(sweeper_store.pool())
             .await
