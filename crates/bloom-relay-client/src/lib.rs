@@ -334,10 +334,7 @@ impl TunnelClient {
             .map_err(|_| ClientError::Transport)?;
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
-            connection
-                .await
-                .map_err(|_| ClientError::Transport)
-                .map(|_| true)
+            TunnelTaskCompletion::Connection(connection.await.map_err(|_| ClientError::Transport))
         });
         let uri: Uri = format!("https://{}/v1/tunnel", self.config.control_server_name)
             .parse()
@@ -378,9 +375,11 @@ impl TunnelClient {
                 },
                 task = tasks.join_next() => {
                     match task {
-                        Some(Ok(Ok(true))) => return Err(ClientError::Transport),
-                        Some(Ok(Ok(false))) => continue,
-                        Some(Ok(Err(error))) => return Err(error),
+                        Some(Ok(completion)) => {
+                            if let Some(error) = completion.into_fatal_error() {
+                                return Err(error);
+                            }
+                        }
                         Some(Err(_)) | None => return Err(ClientError::Transport),
                     }
                 }
@@ -401,12 +400,34 @@ impl TunnelClient {
                             let Ok(permit) = streams.clone().try_acquire_owned() else { continue; };
                             tasks.spawn(async move {
                                 let _permit = permit;
-                                open_stream(&mut sender, upstream, &authority, installation_id, generation, &credential, &ticket).await.map(|_| false)
+                                TunnelTaskCompletion::Stream(
+                                    open_stream(&mut sender, upstream, &authority, installation_id, generation, &credential, &ticket).await
+                                )
                             });
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+enum TunnelTaskCompletion {
+    Connection(Result<(), ClientError>),
+    Stream(Result<(), ClientError>),
+}
+
+impl TunnelTaskCompletion {
+    fn into_fatal_error(self) -> Option<ClientError> {
+        match self {
+            // The HTTP/2 driver owns the shared transport. Any completion means
+            // the control tunnel can no longer admit browser streams.
+            Self::Connection(Ok(())) => Some(ClientError::Transport),
+            Self::Connection(Err(error)) => Some(error),
+            // CONNECT rejection, local upstream failure, resets, and stream
+            // timeouts affect only the browser connection that owns the stream.
+            // A connection-wide HTTP/2 failure is reported by the driver above.
+            Self::Stream(Ok(()) | Err(_)) => None,
         }
     }
 }
@@ -610,6 +631,7 @@ fn trusted_response_expiry(expires_at_ms: u64, now_ms: u64, lifetime_ms: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn upstream_cannot_be_supplied_by_gateway_or_config() {
         rustls::crypto::ring::default_provider()

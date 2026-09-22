@@ -1311,19 +1311,9 @@ backend reject
                 let (tcp, _) = ingress.accept().await.unwrap();
                 let gateway = ingress_gateway.clone();
                 tokio::spawn(async move {
-                    browser_connection(gateway, tcp).await.unwrap();
+                    let _ = browser_connection(gateway, tcp).await;
                 });
             }
-        });
-        let upstream = TcpListener::bind(CEREMONY_UPSTREAM).await.unwrap();
-        let upstream_tls = TlsAcceptor::from(Arc::new(load_tls(&cert_path, &key_path).unwrap()));
-        let upstream_task = tokio::spawn(async move {
-            let (tcp, _) = upstream.accept().await.unwrap();
-            let mut tls = upstream_tls.accept(tcp).await.unwrap();
-            let mut payload = [0u8; 4];
-            tls.read_exact(&mut payload).await.unwrap();
-            assert_eq!(&payload, b"ping");
-            tls.write_all(b"pong").await.unwrap();
         });
         let credential_path =
             std::env::temp_dir().join(format!("bloom-relay-test-{}.token", Uuid::new_v4()));
@@ -1373,6 +1363,65 @@ backend reject
             .get(&allocation.hostname)
             .unwrap()
             .generation;
+
+        let mut browser_tls = ClientConfig::builder()
+            .with_root_certificates({
+                let mut roots = RootCertStore::empty();
+                let cert = CertificateDer::pem_file_iter(&ca_path)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                roots.add(cert).unwrap();
+                roots
+            })
+            .with_no_client_auth();
+        browser_tls.alpn_protocols.clear();
+        let browser_tls = Arc::new(browser_tls);
+
+        // A browser stream can fail after its authenticated CONNECT succeeds.
+        // With no local ceremony listener yet, this CONNECT gets a genuine
+        // connection refusal. It must not tear down the shared control tunnel.
+        let tcp = TcpStream::connect(ingress_address).await.unwrap();
+        let failed = timeout(
+            Duration::from_secs(5),
+            tokio_rustls::TlsConnector::from(browser_tls.clone()).connect(
+                ServerName::try_from(allocation.hostname.clone()).unwrap(),
+                tcp,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_err());
+        tokio::select! {
+            result = &mut first => panic!("one failed stream stopped the tunnel: {result:?}"),
+            changed = watched.changed() => panic!("one failed stream changed readiness: {changed:?}"),
+            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+        assert!(*watched.borrow(), "one failed stream cleared readiness");
+        assert!(!first.is_finished(), "one failed stream stopped the tunnel");
+        assert_eq!(
+            gateway
+                .tunnels
+                .lock()
+                .await
+                .get(&allocation.hostname)
+                .unwrap()
+                .generation,
+            first_generation,
+            "one failed stream replaced the control tunnel"
+        );
+
+        let upstream = TcpListener::bind(CEREMONY_UPSTREAM).await.unwrap();
+        let upstream_tls = TlsAcceptor::from(Arc::new(load_tls(&cert_path, &key_path).unwrap()));
+        let upstream_task = tokio::spawn(async move {
+            let (tcp, _) = upstream.accept().await.unwrap();
+            let mut tls = upstream_tls.accept(tcp).await.unwrap();
+            let mut payload = [0u8; 4];
+            tls.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            tls.write_all(b"pong").await.unwrap();
+        });
 
         // A separate backend HTTP/2 connection cannot rely on the POST stream's
         // connection-local state. Exercise per-CONNECT authentication and ticket
@@ -1562,21 +1611,8 @@ backend reject
                 .is_some_and(|tunnel| tunnel.generation == extra_generation_b)
         );
 
-        let mut browser_tls = ClientConfig::builder()
-            .with_root_certificates({
-                let mut roots = RootCertStore::empty();
-                let cert = CertificateDer::pem_file_iter(&ca_path)
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap();
-                roots.add(cert).unwrap();
-                roots
-            })
-            .with_no_client_auth();
-        browser_tls.alpn_protocols.clear();
         let tcp = TcpStream::connect(ingress_address).await.unwrap();
-        let mut browser = tokio_rustls::TlsConnector::from(Arc::new(browser_tls))
+        let mut browser = tokio_rustls::TlsConnector::from(browser_tls)
             .connect(
                 ServerName::try_from(allocation.hostname.clone()).unwrap(),
                 tcp,
