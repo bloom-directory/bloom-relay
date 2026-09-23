@@ -273,6 +273,8 @@ pub enum ClientError {
     IncompatibleProtocol { offered: u16, supported: u16 },
     #[error("relay transport unavailable")]
     Transport,
+    #[error("relay control tunnel is draining and must reconnect")]
+    TunnelRetired,
     #[error("relay rejected tunnel")]
     Rejected,
 }
@@ -424,9 +426,12 @@ impl TunnelTaskCompletion {
             // the control tunnel can no longer admit browser streams.
             Self::Connection(Ok(())) => Some(ClientError::Transport),
             Self::Connection(Err(error)) => Some(error),
+            // A GOAWAY retires this shared HTTP/2 connection. The control
+            // reader can still receive OPEN events briefly, so make the
+            // supervisor replace the tunnel instead of silently dropping them.
+            Self::Stream(Err(ClientError::TunnelRetired)) => Some(ClientError::TunnelRetired),
             // CONNECT rejection, local upstream failure, resets, and stream
             // timeouts affect only the browser connection that owns the stream.
-            // A connection-wide HTTP/2 failure is reported by the driver above.
             Self::Stream(Ok(()) | Err(_)) => None,
         }
     }
@@ -549,11 +554,11 @@ async fn open_stream_inner(
         .map_err(|_| ClientError::InvalidConfiguration)?;
     let (response, mut outbound) = sender
         .send_request(request, false)
-        .map_err(|_| ClientError::Transport)?;
+        .map_err(map_h2_stream_error)?;
     let response = timeout(Duration::from_secs(10), response)
         .await
         .map_err(|_| ClientError::Transport)?
-        .map_err(|_| ClientError::Transport)?;
+        .map_err(map_h2_stream_error)?;
     if !response.status().is_success() {
         return Err(ClientError::Rejected);
     }
@@ -580,7 +585,7 @@ async fn open_stream_inner(
                             local.write_all(&frame).await.map_err(|_| ClientError::Transport)?;
                             inbound.flow_control().release_capacity(frame.len()).map_err(|_| ClientError::Transport)?;
                         }
-                        Some(Err(_)) => return Err(ClientError::Transport),
+                        Some(Err(error)) => return Err(map_h2_stream_error(error)),
                         None => {
                             remote_done = true;
                             local.shutdown().await.map_err(|_| ClientError::Transport)?;
@@ -592,6 +597,14 @@ async fn open_stream_inner(
         }).await.map_err(|_| ClientError::Transport)??;
     }
     Ok(())
+}
+
+fn map_h2_stream_error(error: h2::Error) -> ClientError {
+    if error.is_go_away() {
+        ClientError::TunnelRetired
+    } else {
+        ClientError::Transport
+    }
 }
 
 async fn send_bounded(
@@ -667,5 +680,23 @@ mod tests {
             lifetime
         ));
         assert!(!trusted_response_expiry(now, now, lifetime));
+    }
+
+    #[test]
+    fn retired_tunnel_stream_failure_restarts_shared_connection() {
+        assert!(matches!(
+            TunnelTaskCompletion::Stream(Err(ClientError::TunnelRetired)).into_fatal_error(),
+            Some(ClientError::TunnelRetired)
+        ));
+        assert!(
+            TunnelTaskCompletion::Stream(Err(ClientError::Rejected))
+                .into_fatal_error()
+                .is_none()
+        );
+        assert!(
+            TunnelTaskCompletion::Stream(Err(ClientError::Transport))
+                .into_fatal_error()
+                .is_none()
+        );
     }
 }

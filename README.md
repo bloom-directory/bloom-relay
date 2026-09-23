@@ -11,6 +11,10 @@ configuration. It provides hostname allocation, authoritative DNS automation,
 authenticated outbound tunnels, certificate challenge support and operations.
 Broker serves the ceremony application and terminates Browser TLS. Signer retains
 custody and ceremony authority. Relay owns neither wallet state nor approval logic.
+The Broker-integrated client uses the maintained `h2` crate for HTTP/2. When a
+GOAWAY retires the shared tunnel connection, the client exits so Broker's
+existing runtime supervisor reconnects it; failures confined to an individual
+browser stream remain isolated to that stream.
 
 See the sibling [remote architecture](../bloom/docs/architecture/Open-Internet%20Sealed%20Approval%20Ceremony.md)
 and [cross-stack plan](../bloom/docs/plans/2026-09-17-remote-ceremonies.md).
