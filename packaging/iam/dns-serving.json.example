@@ -1,0 +1,31 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadDelegatedZone",
+      "Effect": "Allow",
+      "Action": "route53:ListResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/REPLACE_ZONE_ID"
+    },
+    {
+      "Sid": "ServingRecordsOnly",
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/REPLACE_ZONE_ID",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "route53:ChangeResourceRecordSetsRecordTypes": ["A", "AAAA", "CAA"],
+          "route53:ChangeResourceRecordSetsActions": ["UPSERT", "DELETE"]
+        },
+        "ForAllValues:StringLike": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["*.relay.bloom.directory"]
+        },
+        "Null": {
+          "route53:ChangeResourceRecordSetsRecordTypes": "false",
+          "route53:ChangeResourceRecordSetsActions": "false",
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": "false"
+        }
+      }
+    }
+  ]
+}

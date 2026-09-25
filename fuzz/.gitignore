@@ -1,0 +1,9 @@
+/target/
+/artifacts/
+/coverage/
+/corpus/client_hello/*
+!/corpus/client_hello/valid_sni
+!/corpus/client_hello/truncated
+/corpus/control_frames/*
+!/corpus/control_frames/heartbeat
+!/corpus/control_frames/split_lines

@@ -1,0 +1,31 @@
+[Unit]
+Description=Bloom relay DNS-01 TXT worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bloom-relay-dns-challenge
+Group=bloom-relay-dns-challenge
+SupplementaryGroups=bloom-relay-witness
+EnvironmentFile=/etc/bloom-relay/dns-challenge.env
+Environment=BLOOM_RELAY_MODE=dns-challenge
+Environment=AWS_SHARED_CREDENTIALS_FILE=%d/aws
+Environment=AWS_EC2_METADATA_DISABLED=true
+LoadCredential=aws:/etc/bloom-relay/aws-challenge-credentials
+ExecStart=/usr/local/libexec/bloom-relay/bloom-relay-control
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+UMask=0007
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/bloom-relay/witness
+
+[Install]
+WantedBy=multi-user.target
