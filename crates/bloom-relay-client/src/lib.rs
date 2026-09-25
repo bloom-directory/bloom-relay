@@ -28,6 +28,9 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 
+/// Default loopback listener where Broker receives hosted-surface streams.
+/// Broker may configure another IPv4 loopback port so several Triads can run
+/// side by side; the gateway never supplies it.
 pub const CEREMONY_UPSTREAM: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18735);
 const CONTROL_ORIGIN: &str = "https://relay-control.bloom.directory";
 
@@ -285,9 +288,13 @@ pub struct TunnelClient {
 }
 
 impl TunnelClient {
+    /// `upstream` comes from Broker's protected configuration, never from the
+    /// relay. It must be an IPv4 loopback port; Broker keeps it distinct from
+    /// its local ceremony port, whose listener also rejects relay hostnames.
     pub fn new(config: TunnelConfig, upstream: SocketAddr) -> Result<Self, ClientError> {
         validate_hostname(&config.hostname).map_err(|_| ClientError::InvalidConfiguration)?;
-        if upstream != CEREMONY_UPSTREAM
+        if upstream.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST)
+            || upstream.port() == 0
             || config.credential_path.as_os_str().is_empty()
             || config.control_server_name.is_empty()
         {
@@ -646,7 +653,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn upstream_cannot_be_supplied_by_gateway_or_config() {
+    fn upstream_is_a_configured_loopback_port_never_a_remote_address() {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
@@ -661,8 +668,20 @@ mod tests {
             credential_path: PathBuf::from("/protected/test-token"),
             tls: Arc::new(tls),
         };
-        assert!(TunnelClient::new(config.clone(), "127.0.0.1:18734".parse().unwrap()).is_err());
-        assert!(TunnelClient::new(config, CEREMONY_UPSTREAM).is_ok());
+        for rejected in [
+            "127.0.0.1:0",
+            "0.0.0.0:18735",
+            "10.0.0.1:18735",
+            "[::1]:18735",
+        ] {
+            assert!(
+                TunnelClient::new(config.clone(), rejected.parse().unwrap()).is_err(),
+                "{rejected}"
+            );
+        }
+        assert!(TunnelClient::new(config.clone(), CEREMONY_UPSTREAM).is_ok());
+        // A second Triad beside an installed one selects its own loopback port.
+        assert!(TunnelClient::new(config, "127.0.0.1:38735".parse().unwrap()).is_ok());
     }
 
     #[test]
