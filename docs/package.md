@@ -42,6 +42,22 @@ missing or stale witness fails closed; a failed witness write is an incident,
 not a reason to reset the marker. The shared witness group is trusted for
 integrity, so grant membership only to these processes and the operator.
 
+Production also keeps the witness off the host, in a versioned S3 bucket with
+Object Lock, so losing or rolling back the whole host cannot rewind it. Set
+`BLOOM_RELAY_RESTORE_WITNESS_S3_BUCKET`, `BLOOM_RELAY_RESTORE_WITNESS_S3_KEY`
+(one object per placement, for example `relay-1/revision`) and
+`BLOOM_RELAY_RESTORE_WITNESS_S3_REGION` in every service's env file; a bucket
+without its key or region refuses to start. Credentials come only from the
+instance role through IMDSv2, never the default chain, so the DNS workers'
+own credentials files are not used for it. The instance role may read and
+put that object but never delete it or bypass retention. Each security
+transition advances the S3 object with a conditional write before the local
+file, and every check compares the database with the higher of the two. A
+replacement host with no local file therefore starts only from a database at
+or above the S3 revision; a database below it fails closed. The first start
+after enabling S3 publishes the existing local revision. S3 being
+unreachable fails security transitions closed, like an unwritable local file.
+
 The first topology uses a dedicated public IP for Browser ingress and a
 different control IP for `relay-control.bloom.directory`. Gateway ingress
 binds its dedicated IP on port 443, preserving Browser source IP for the

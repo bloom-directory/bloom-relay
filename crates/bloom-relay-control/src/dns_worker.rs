@@ -40,7 +40,15 @@ impl DnsWorker {
                 DnsProvider::Cloudflare(CloudflareProvider::new(zone, token, scope)?)
             }
             ProviderKind::Route53 => {
-                let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                // Only the worker's own credentials file: never the default
+                // chain's fall-through to the host's instance role, which
+                // the S3 restore witness uses.
+                let aws = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .credentials_provider(
+                        aws_config::profile::ProfileFileCredentialsProvider::builder().build(),
+                    )
+                    .load()
+                    .await;
                 DnsProvider::Route53(Route53Provider::new(
                     aws_sdk_route53::Client::new(&aws),
                     zone,

@@ -11,7 +11,6 @@ SupplementaryGroups=bloom-relay-witness
 EnvironmentFile=/etc/bloom-relay/dns-serving.env
 Environment=BLOOM_RELAY_MODE=dns-serving
 Environment=AWS_SHARED_CREDENTIALS_FILE=%d/aws
-Environment=AWS_EC2_METADATA_DISABLED=true
 LoadCredential=aws:/etc/bloom-relay/aws-serving-credentials
 ExecStart=/usr/local/libexec/bloom-relay/bloom-relay-control
 Restart=on-failure

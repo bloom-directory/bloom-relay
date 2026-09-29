@@ -12,8 +12,11 @@ use std::{path::PathBuf, sync::Arc};
 use thiserror::Error;
 use uuid::Uuid;
 mod restore;
-pub use restore::{RestoreWitness, WitnessError};
+pub use restore::{
+    RemoteRevision, RemoteWitness, RemoteWrite, RestoreWitness, WitnessError, WitnessFuture,
+};
 mod ct;
+pub mod s3_witness;
 pub use ct::{CtAlert, CtLagAlert};
 
 #[derive(Debug, Error)]
@@ -79,7 +82,9 @@ impl Store {
     pub async fn connect_with_witness(url: &str, path: PathBuf) -> Result<Self, StoreError> {
         let mut store = Self::connect(url).await?;
         store.witness = Some(Arc::new(
-            RestoreWitness::new(path).map_err(|error| StoreError::Witness(error.to_string()))?,
+            RestoreWitness::from_env(path)
+                .await
+                .map_err(|error| StoreError::Witness(error.to_string()))?,
         ));
         store.acknowledge().await?;
         Ok(store)
@@ -112,7 +117,8 @@ impl Store {
         let store = Self {
             pool,
             witness: Some(Arc::new(
-                RestoreWitness::new(path)
+                RestoreWitness::from_env(path)
+                    .await
                     .map_err(|error| StoreError::Witness(error.to_string()))?,
             )),
             acme_environment: AcmeEnvironment::Production,

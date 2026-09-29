@@ -40,9 +40,12 @@ security transition. A missing witness is accepted only for an empty new
 database; an established database without its witness fails closed. A
 database below its witness makes the service refuse startup or stop serving.
 If a committed mutation cannot advance the witness, the request fails and
-the operator reconciles the durable operation before retry. Production
-recovery still needs independently retained audit/backup evidence and a
-documented restore rehearsal.
+the operator reconciles the durable operation before retry. With the S3
+witness configured (see [`package.md`](package.md)), the same rules apply to
+the higher of the local and S3 revisions, so a whole-host rollback or a
+replacement host cannot start below the last acknowledged transition.
+Production recovery still needs independently retained audit/backup evidence
+and a documented restore rehearsal.
 Do not pass bearer values on command lines or environment variables. Broker
 reads its tunnel credential from an owner-only file. The signed control API
 uses its fixed public TLS origin; metrics and backend management belong on a
