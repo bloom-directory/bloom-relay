@@ -1,0 +1,11 @@
+region             = "eu-central-1"
+backup_copy_region = "eu-north-1"
+placement          = "relay-1"
+alert_email        = "REPLACE@example.com"
+
+# Leave empty to administer through SSM Session Manager only.
+admin_ssh_cidrs = []
+
+# GOVERNANCE while restore drills run; switch to COMPLIANCE before
+# production (irreversible for existing object versions).
+witness_retention_mode = "GOVERNANCE"

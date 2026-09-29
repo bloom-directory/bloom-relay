@@ -1,0 +1,7 @@
+# terraform init -backend-config=backend.hcl
+# Create the state bucket once, by hand, with versioning and encryption.
+bucket       = "REPLACE-bloom-relay-terraform-state"
+key          = "relay-1/terraform.tfstate"
+region       = "eu-central-1"
+encrypt      = true
+use_lockfile = true
