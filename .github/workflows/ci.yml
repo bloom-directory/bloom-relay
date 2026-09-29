@@ -4,7 +4,12 @@ on:
   pull_request:
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # The hosted relay runs on arm64 (Graviton); x86_64 stays supported.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     services:
       postgres:
         image: postgres:14
@@ -75,7 +80,15 @@ jobs:
       - run: cargo +nightly fuzz run client_hello -- -runs=1000 -max_len=65537
       - run: cargo +nightly fuzz run control_frames -- -runs=1000 -max_len=16385
   package:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,5 +98,5 @@ jobs:
       - run: scripts/check-package-template.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: relay-linux-package
+          name: relay-linux-${{ matrix.arch }}-package
           path: dist/*.tar.gz*

@@ -3,7 +3,9 @@
 `scripts/package-release.sh` builds locked release binaries and a sorted,
 timestamped archive containing five executables, systemd units, example
 environment files, a control-plane HAProxy route, and role policy examples.
-CI builds this package; publishing and installing it are separate operations.
+CI builds and tests it natively for `x86_64` and `aarch64` (the archive name
+carries the architecture); the hosted relay runs on `aarch64`. Publishing and
+installing it are separate operations.
 The unit files are templates, not an automatic installer. Validate the archive
 checksum, substitute the assigned network addresses and hosted zone, then
 review every permission before installation.
