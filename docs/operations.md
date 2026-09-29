@@ -55,11 +55,14 @@ per minute; pending allocations expire after 24 hours. Browser ingress
 admits at most 120 new TLS connections per source IP and 5,000 globally per
 fixed minute. Tune these values from capacity/NAT measurements before public
 opening while retaining Broker's installation and recovery-ID quotas.
-In the packaged topology, the API sees HAProxy's loopback address rather than
-the enrollment client's address, so every public bootstrap shares the same
-10-per-minute source bucket. Before public enrollment, add an authenticated,
-trusted client-address transport and make the API consume it without accepting
-an unrestricted forwarded-address header. This does not affect the gateway's
+In the packaged topology HAProxy terminates public TLS, so the API's TCP peer
+is always HAProxy's loopback address. HAProxy therefore sends each client's
+address with PROXY protocol v2 (`send-proxy-v2`) at the start of its backend
+connection, before TLS, and the API keys its quotas on it when
+`BLOOM_RELAY_CONTROL_PROXY_PROTOCOL=v2`. In that mode every connection must
+carry the header, the API refuses to start on a non-loopback bind, and it never
+reads client addresses from HTTP headers. Without it, every public bootstrap
+would share HAProxy's single source bucket. This does not affect the gateway's
 direct Browser-ingress source quota.
 
 The selected rollout uses a separately delegated Route 53 child zone. For an

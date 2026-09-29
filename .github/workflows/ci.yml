@@ -37,6 +37,14 @@ jobs:
         env:
           BLOOM_RELAY_TEST_HAPROXY_IMAGE: haproxy:3.2-alpine
         run: cargo test -p bloom-relay --bin bloom-relay haproxy_h2_routes_authenticated_tunnels_across_backend_connections --locked -- --ignored
+      - name: Test API client addresses through HAProxy 3.0
+        env:
+          BLOOM_RELAY_TEST_HAPROXY_IMAGE: haproxy:3.0-alpine
+        run: cargo test -p bloom-relay-control --bin bloom-relay-control haproxy_send_proxy_v2_reaches_the_api_over_tls --locked -- --ignored
+      - name: Test API client addresses through HAProxy 3.2
+        env:
+          BLOOM_RELAY_TEST_HAPROXY_IMAGE: haproxy:3.2-alpine
+        run: cargo test -p bloom-relay-control --bin bloom-relay-control haproxy_send_proxy_v2_reaches_the_api_over_tls --locked -- --ignored
       - run: cargo fmt --manifest-path tools/deployed-smoke/Cargo.toml --all -- --check
       - run: cargo check --manifest-path tools/deployed-smoke/Cargo.toml --locked
       - run: cargo clippy --manifest-path tools/deployed-smoke/Cargo.toml --locked -- -D warnings

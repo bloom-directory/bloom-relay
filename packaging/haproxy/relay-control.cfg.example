@@ -19,9 +19,11 @@ frontend relay_control
   use_backend relay_tunnel if tunnel_open
   use_backend relay_tunnel if tunnel_attach
   default_backend relay_api
+  # PROXY v2 hands the API each client's address for its bootstrap quotas;
+  # the API sets BLOOM_RELAY_CONTROL_PROXY_PROTOCOL=v2 to require it.
 
 backend relay_tunnel
   server gateway 127.0.0.1:18444 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2
 
 backend relay_api
-  server api 127.0.0.1:18443 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2
+  server api 127.0.0.1:18443 send-proxy-v2 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2

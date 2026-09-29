@@ -23,6 +23,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+mod client_addr;
 mod dns_worker;
 
 struct AppState {
@@ -218,10 +219,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
     let handle = axum_server::Handle::new();
+    // Quotas key on the client address: the TCP peer, or with PROXY
+    // protocol the client HAProxy names (see client_addr.rs).
+    let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls)
+        .acceptor(client_addr::ClientAddrAcceptor::from_env(bind)?);
     let mut server = Box::pin(
-        axum_server::bind_rustls(bind, tls)
+        axum_server::bind(bind)
+            .acceptor(acceptor)
             .handle(handle.clone())
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>()),
+            .serve(app.into_make_service()),
     );
     health.set_ready(true);
     tokio::select! {

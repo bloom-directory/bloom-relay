@@ -28,6 +28,9 @@ serde_jcs.workspace = true
 rustls.workspace = true
 aws-config.workspace = true
 aws-sdk-route53.workspace = true
+tower-layer = "0.3.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+rcgen = "0.14.7"
+tokio-rustls.workspace = true
