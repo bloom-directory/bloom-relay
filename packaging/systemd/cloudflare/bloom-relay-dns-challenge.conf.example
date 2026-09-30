@@ -1,0 +1,9 @@
+# Install as /etc/systemd/system/bloom-relay-dns-challenge.service.d/cloudflare.conf.
+[Service]
+EnvironmentFile=
+EnvironmentFile=/etc/bloom-relay/dns-challenge.cloudflare.env
+Environment=
+Environment=BLOOM_RELAY_MODE=dns-challenge
+Environment=BLOOM_RELAY_CLOUDFLARE_TOKEN_FILE=%d/cloudflare
+LoadCredential=
+LoadCredential=cloudflare:/etc/bloom-relay/cloudflare-challenge-token

@@ -1,0 +1,29 @@
+[package]
+name = "bloom-relay-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bloom-relay-protocol = { path = "../crates/bloom-relay-protocol", version = "0.1.0" }
+libfuzzer-sys = "0.4.12"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+
+[[bin]]
+name = "client_hello"
+path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_frames"
+path = "fuzz_targets/control_frames.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -1,0 +1,34 @@
+[Unit]
+Description=Bloom relay enrollment and control API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bloom-relay-api
+Group=bloom-relay-api
+SupplementaryGroups=bloom-relay-witness
+EnvironmentFile=/etc/bloom-relay/api.env
+Environment=BLOOM_RELAY_MODE=api
+Environment=BLOOM_RELAY_CONTROL_CERT_PATH=%d/control-cert
+Environment=BLOOM_RELAY_CONTROL_KEY_PATH=%d/control-key
+Environment=BLOOM_RELAY_RECEIPT_KEY_PATH=%d/receipt-key
+LoadCredential=control-cert:/etc/bloom-relay/control-cert.pem
+LoadCredential=control-key:/etc/bloom-relay/control-key.pem
+LoadCredential=receipt-key:/etc/bloom-relay/receipt-key
+ExecStart=/usr/local/libexec/bloom-relay/bloom-relay-control
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+UMask=0007
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/bloom-relay/witness
+
+[Install]
+WantedBy=multi-user.target

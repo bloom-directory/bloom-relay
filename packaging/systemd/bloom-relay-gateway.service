@@ -1,0 +1,32 @@
+[Unit]
+Description=Bloom relay opaque TLS gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bloom-relay-gateway
+Group=bloom-relay-gateway
+SupplementaryGroups=bloom-relay-witness
+EnvironmentFile=/etc/bloom-relay/gateway.env
+Environment=BLOOM_RELAY_CONTROL_CERT_PATH=%d/control-cert
+Environment=BLOOM_RELAY_CONTROL_KEY_PATH=%d/control-key
+LoadCredential=control-cert:/etc/bloom-relay/control-cert.pem
+LoadCredential=control-key:/etc/bloom-relay/control-key.pem
+ExecStart=/usr/local/libexec/bloom-relay/bloom-relay
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+UMask=0007
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/lib/bloom-relay/witness
+
+[Install]
+WantedBy=multi-user.target
