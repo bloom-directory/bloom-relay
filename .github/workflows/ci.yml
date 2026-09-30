@@ -1,6 +1,8 @@
 name: Relay
 on:
+  # Tags run the release workflow; CI here would repeat the branch run.
   push:
+    branches: ["**"]
   pull_request:
 jobs:
   rust:

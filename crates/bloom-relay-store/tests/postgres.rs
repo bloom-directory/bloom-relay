@@ -696,3 +696,72 @@ async fn ct_fixture_flags_unexpected_issuance_and_preserves_checkpoint() {
     assert_eq!(alerts, 1);
     assert!(store.ct_feed_lag_seconds(&source).await.unwrap().unwrap() < 15);
 }
+
+/// Every restore-fence trigger fires at commit. Mid-transaction fence updates
+/// let concurrent security transitions deadlock on the fence row (40P01).
+#[tokio::test]
+async fn restore_fence_triggers_advance_at_commit() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+    // Two transitions taking the installation row and the fence in opposite
+    // orders. With the fence advanced mid-transaction, the first holds the
+    // fence and waits for the row while the second holds the row and waits
+    // for the fence: PostgreSQL aborts one with 40P01. Deferred to commit,
+    // the second commits first and the first follows.
+    let id = store
+        .allocate(Uuid::new_v4(), [11u8; 32], "test-shard")
+        .await
+        .unwrap()
+        .installation_id;
+    let before = store.restore_revision().await.unwrap();
+    let audit = "INSERT INTO security_audit(installation_id,event) VALUES ($1,'fence_probe')";
+    let touch = "UPDATE installations SET generation=generation WHERE installation_id=$1";
+    let mut first = store.pool().begin().await.unwrap();
+    let mut second = store.pool().begin().await.unwrap();
+    sqlx::query(audit)
+        .bind(id)
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    sqlx::query(touch)
+        .bind(id)
+        .execute(&mut *second)
+        .await
+        .unwrap();
+    let first = async move {
+        sqlx::query(touch).bind(id).execute(&mut *first).await?;
+        first.commit().await
+    };
+    let second = async move {
+        sqlx::query(audit).bind(id).execute(&mut *second).await?;
+        second.commit().await
+    };
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("opposite-order transitions finish");
+    first.unwrap();
+    second.unwrap();
+    assert!(store.restore_revision().await.unwrap() >= before + 2);
+
+    let triggers: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT tgname::text, tgdeferrable, tginitdeferred FROM pg_trigger
+         WHERE NOT tgisinternal AND tgname LIKE '%restore_fence' ORDER BY 1",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        triggers,
+        [
+            "ct_alert_restore_fence",
+            "ct_checkpoint_restore_fence",
+            "ct_health_alert_restore_fence",
+            "security_audit_restore_fence",
+        ]
+        .map(|name| (name.to_owned(), true, true))
+    );
+}
