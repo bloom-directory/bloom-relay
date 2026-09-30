@@ -31,7 +31,13 @@ Apply `packaging/postgres/runtime-grants.sql.example` as the schema owner
 after selecting the production database name. Test each role's allowed and
 denied operations under `SET ROLE` during staging acceptance. PostgreSQL peer
 authentication and its Unix socket must map each service UID to its DB role;
-the example URLs contain no DB password. The API has no DNS provider credential.
+the example URLs contain no DB password. With a managed PostgreSQL that has no
+peer authentication, give each role a password and deliver it as a systemd
+credential file containing only the password (`LoadCredential=db-password:...`)
+named by `BLOOM_RELAY_DATABASE_PASSWORD_FILE=%d/db-password`; never put it in a
+URL or env file. (`PGPASSFILE` does not work here: systemd credentials are mode
+0440, which the pgpass convention rejects.) Use `sslmode=verify-full` with the
+provider's CA bundle in a world-readable path. The API has no DNS provider credential.
 Only the serving and challenge workers receive distinct provider credentials
 through systemd `LoadCredential`; neither worker receives the receipt-signing key.
 

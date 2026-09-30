@@ -6,7 +6,7 @@ use bloom_relay_protocol::{
 use data_encoding::BASE32_NOPAD;
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Row, postgres::PgConnectOptions};
 use std::net::IpAddr;
 use std::{path::PathBuf, sync::Arc};
 use thiserror::Error;
@@ -65,11 +65,32 @@ impl DnsJobScope {
     }
 }
 
+/// Names a file holding the database password, for services that receive it
+/// as a systemd credential. Those files are mode 0440, which PostgreSQL's
+/// pgpass convention (and sqlx) rejects as too permissive.
+const PASSWORD_FILE_ENV: &str = "BLOOM_RELAY_DATABASE_PASSWORD_FILE";
+
+/// Connection settings from `url`, with the password taken from
+/// `BLOOM_RELAY_DATABASE_PASSWORD_FILE` when it is set. The file holds only
+/// the password; one trailing newline is ignored.
+fn connect_options(url: &str) -> Result<PgConnectOptions, StoreError> {
+    let options: PgConnectOptions = url.parse()?;
+    let Some(path) = std::env::var_os(PASSWORD_FILE_ENV) else {
+        return Ok(options);
+    };
+    let password = std::fs::read_to_string(path).map_err(sqlx::Error::Io)?;
+    let password = password.strip_suffix('\n').unwrap_or(&password);
+    if password.is_empty() || password.contains('\n') {
+        return Err(StoreError::InvalidRequest);
+    }
+    Ok(options.password(password))
+}
+
 impl Store {
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(16)
-            .connect(url)
+            .connect_with(connect_options(url)?)
             .await?;
         sqlx::migrate!("../../migrations").run(&pool).await?;
         Ok(Self {
@@ -98,7 +119,7 @@ impl Store {
     ) -> Result<Self, StoreError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(16)
-            .connect(url)
+            .connect_with(connect_options(url)?)
             .await?;
         let versions: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
             "SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version",
