@@ -101,6 +101,10 @@ fn cleanup(path: &PathBuf) {
     let _ = std::fs::remove_file(path.with_extension("lock"));
 }
 
+/// These tests share one database revision, so they run one at a time: a
+/// test advancing it would otherwise race another's expectations.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn store() -> Option<Store> {
     let url = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL").ok()?;
     let store = Store::connect(&url).await.unwrap();
@@ -114,6 +118,7 @@ async fn store() -> Option<Store> {
 
 #[tokio::test]
 async fn a_replacement_host_starts_from_the_remote_witness() {
+    let _serial = SERIAL.lock().await;
     let Some(store) = store().await else { return };
     let revision = store.restore_revision().await.unwrap();
     let remote = Arc::new(FakeRemote::holding(revision));
@@ -140,6 +145,7 @@ async fn a_replacement_host_starts_from_the_remote_witness() {
 
 #[tokio::test]
 async fn a_whole_host_rollback_below_the_remote_witness_fails_closed() {
+    let _serial = SERIAL.lock().await;
     let Some(store) = store().await else { return };
     let revision = store.restore_revision().await.unwrap();
     // The remote witness saw more than this database holds: the database
@@ -161,6 +167,7 @@ async fn a_whole_host_rollback_below_the_remote_witness_fails_closed() {
 
 #[tokio::test]
 async fn an_established_database_with_no_witness_anywhere_fails_closed() {
+    let _serial = SERIAL.lock().await;
     let Some(store) = store().await else { return };
     let remote = Arc::new(FakeRemote::default());
     let path = local_path();
@@ -178,6 +185,7 @@ async fn an_established_database_with_no_witness_anywhere_fails_closed() {
 
 #[tokio::test]
 async fn enabling_the_remote_witness_publishes_the_local_revision() {
+    let _serial = SERIAL.lock().await;
     let Some(store) = store().await else { return };
     let revision = store.restore_revision().await.unwrap();
     let remote = Arc::new(FakeRemote::default());
@@ -195,6 +203,7 @@ async fn enabling_the_remote_witness_publishes_the_local_revision() {
 
 #[tokio::test]
 async fn a_lost_write_race_rereads_and_retries() {
+    let _serial = SERIAL.lock().await;
     let Some(store) = store().await else { return };
     let revision = store.restore_revision().await.unwrap();
     let remote = Arc::new(FakeRemote::holding(revision));
@@ -216,6 +225,7 @@ async fn a_lost_write_race_rereads_and_retries() {
 
 #[tokio::test]
 async fn an_unchanged_revision_needs_no_remote_call() {
+    let _serial = SERIAL.lock().await;
     let Some(store) = store().await else { return };
     let revision = store.restore_revision().await.unwrap();
     let remote = Arc::new(FakeRemote::holding(revision));
@@ -226,13 +236,8 @@ async fn an_unchanged_revision_needs_no_remote_call() {
         .with_remote(remote.clone());
     witness.verify_and_advance(&store).await.unwrap();
     let reads = remote.reads.load(Ordering::SeqCst);
-    // Other tests share the database and may advance it; only a quiet
-    // interval proves the cache.
-    if store.restore_revision().await.unwrap() == remote.revision().unwrap() {
-        witness.verify_and_advance(&store).await.unwrap();
-        if store.restore_revision().await.unwrap() == remote.revision().unwrap() {
-            assert_eq!(remote.reads.load(Ordering::SeqCst), reads);
-        }
-    }
+    witness.verify_and_advance(&store).await.unwrap();
+    assert_eq!(remote.reads.load(Ordering::SeqCst), reads);
+    assert_eq!(remote.writes.load(Ordering::SeqCst), 0);
     cleanup(&path);
 }
