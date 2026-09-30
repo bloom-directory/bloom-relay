@@ -4,8 +4,16 @@
 timestamped archive containing five executables, systemd units, example
 environment files, a control-plane HAProxy route, and role policy examples.
 CI builds and tests it natively for `x86_64` and `aarch64` (the archive name
-carries the architecture); the hosted relay runs on `aarch64`. Publishing and
-installing it are separate operations.
+carries the architecture); the hosted relay runs on `aarch64`.
+
+A `v*` tag on a `master` commit runs `.github/workflows/release.yml`: it builds
+both packages, publishes them as a GitHub release, then deploys the `aarch64`
+package to the hosted relay from the protected `production` environment after
+a reviewer approves. The deploy signs in to AWS with GitHub's OIDC token (no
+stored keys), uploads the package and runs a single SSM document on the host
+that installs it, migrates, restarts the running services and switches back
+to the previous release if readiness fails. The AWS side and the host scripts
+live in the private infrastructure repository.
 The unit files are templates, not an automatic installer. Validate the archive
 checksum, substitute the assigned network addresses and hosted zone, then
 review every permission before installation.

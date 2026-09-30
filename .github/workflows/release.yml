@@ -1,0 +1,123 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Release only commits on master
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - run: scripts/package-release.sh
+      - run: scripts/check-package-template.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-linux-${{ matrix.arch }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify checksums
+        working-directory: dist
+        run: for sum in *.sha256; do sed 's# dist/# #' "$sum" | sha256sum -c -; done
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes "Relay service packages for Linux x86_64 and aarch64, built from $GITHUB_SHA. Install as described in docs/package.md."
+
+  # Deploys the aarch64 package to the hosted relay. Runs in the protected
+  # production environment, so it waits for a reviewer's approval; AWS trusts
+  # only that environment's OIDC token.
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ secrets.RELAY_AWS_REGION }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: relay-linux-aarch64
+          path: dist
+      - name: Sign in to AWS with GitHub OIDC
+        env:
+          ROLE_ARN: ${{ secrets.RELAY_DEPLOY_ROLE_ARN }}
+        run: |
+          token=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          echo "::add-mask::$token"
+          credentials=$(aws sts assume-role-with-web-identity --role-arn "$ROLE_ARN" \
+            --role-session-name "relay-release-$GITHUB_RUN_ID" \
+            --web-identity-token "$token" --duration-seconds 3600 \
+            --query Credentials --output json)
+          for field in AccessKeyId:AWS_ACCESS_KEY_ID SecretAccessKey:AWS_SECRET_ACCESS_KEY SessionToken:AWS_SESSION_TOKEN; do
+            value=$(printf '%s' "$credentials" | jq -r ".${field%%:*}")
+            echo "::add-mask::$value"
+            echo "${field#*:}=$value" >> "$GITHUB_ENV"
+          done
+      - name: Upload the package
+        env:
+          BUCKET: ${{ secrets.RELAY_RELEASES_BUCKET }}
+        working-directory: dist
+        run: |
+          name=$(basename *.tar.gz .tar.gz)
+          sed 's# dist/# #' "$name.tar.gz.sha256" | sha256sum -c -
+          for file in "$name.tar.gz" "$name.tar.gz.sha256"; do
+            aws s3 cp --only-show-errors "$file" "s3://$BUCKET/packages/$file"
+          done
+          echo "PACKAGE_NAME=$name" >> "$GITHUB_ENV"
+      - name: Deploy to the relay host
+        env:
+          DOCUMENT: ${{ secrets.RELAY_DEPLOY_DOCUMENT }}
+          INSTANCE: ${{ secrets.RELAY_INSTANCE_ID }}
+        run: |
+          command=$(aws ssm send-command --document-name "$DOCUMENT" --instance-ids "$INSTANCE" \
+            --comment "release $GITHUB_REF_NAME" --parameters "PackageName=$PACKAGE_NAME" \
+            --query Command.CommandId --output text)
+          status=Pending
+          for attempt in $(seq 1 120); do
+            status=$(aws ssm get-command-invocation --command-id "$command" --instance-id "$INSTANCE" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in Pending|InProgress|Delayed) sleep 10 ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$command" --instance-id "$INSTANCE" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          echo "deploy status: $status"
+          test "$status" = Success
