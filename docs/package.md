@@ -67,11 +67,10 @@ gateway's admission quota. HAProxy terminates the unrelated outer control
 TLS on the control IP and forwards `/v1/tunnel` and CONNECT to the gateway's
 loopback HTTP/2 listener; other control requests go to the API's loopback TLS
 listener. `packaging/haproxy/relay-control.cfg.example` shows the route.
-The API currently observes HAProxy's loopback address for bootstrap challenge
-rate limiting and challenge/enrollment source binding. This makes all public
-callers share one source quota. Resolve this with an authenticated, trusted
-client-address transport before public enrollment; never trust an unrestricted
-forwarded-address header.
+HAProxy sends each client's address to the API with PROXY protocol v2
+(`send-proxy-v2`), and the API keys bootstrap quotas and challenge/enrollment
+source binding on it with `BLOOM_RELAY_CONTROL_PROXY_PROTOCOL=v2`; see
+[`operations.md`](operations.md). It never trusts a forwarded-address header.
 Validate the HAProxy configuration and real HTTP/2 CONNECT behavior with the
 chosen version in staging. Do not proxy Browser ingress without preserving a
 trusted source-IP signal. Control certificate/key copies are accessible only
