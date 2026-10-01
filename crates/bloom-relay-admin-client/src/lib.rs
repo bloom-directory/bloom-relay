@@ -51,12 +51,26 @@ pub enum EnrollmentError {
     InvalidTrust,
     #[error("relay control unavailable")]
     Unavailable,
+    /// The control API (or the proxy in front of it) answered with an HTTP
+    /// error status: a refusal, not an outage. 503 on `/v1/bootstrap/` is the
+    /// closed enrollment gate.
+    #[error("relay control refused the request (HTTP {0})")]
+    Refused(u16),
     #[error("relay request rejected")]
     Rejected,
     #[error("relay response failed identity verification")]
     InvalidReceipt,
     #[error("incompatible relay protocol")]
     IncompatibleProtocol,
+}
+
+/// `ureq` returns HTTP error statuses as errors; keep them apart from
+/// connection failures so a refusal never reads as an outage.
+fn control_error(error: ureq::Error) -> EnrollmentError {
+    match error {
+        ureq::Error::StatusCode(status) => EnrollmentError::Refused(status),
+        _ => EnrollmentError::Unavailable,
+    }
 }
 
 /// The caller owns the protected admin key and relay receipt verification key.
@@ -76,7 +90,7 @@ where
         agent
             .post(format!("{CONTROL_ORIGIN}/v1/bootstrap/challenge"))
             .send_empty()
-            .map_err(|_| EnrollmentError::Unavailable)?,
+            .map_err(control_error)?,
     )?;
     if challenge.version != WIRE_VERSION {
         return Err(EnrollmentError::IncompatibleProtocol);
@@ -117,7 +131,7 @@ where
         agent
             .post(format!("{CONTROL_ORIGIN}/v1/bootstrap/enroll"))
             .send_json(&request)
-            .map_err(|_| EnrollmentError::Unavailable)?,
+            .map_err(control_error)?,
     )?;
     receipt
         .verify_bytes(
@@ -180,7 +194,7 @@ where
         agent
             .post(format!("{CONTROL_ORIGIN}/v1/credentials"))
             .send_json(&request)
-            .map_err(|_| EnrollmentError::Unavailable)?,
+            .map_err(control_error)?,
     )?;
     let receipt_now = now_ms();
     if receipt.version != WIRE_VERSION
@@ -233,7 +247,7 @@ where
             body,
             signature,
         })
-        .map_err(|_| EnrollmentError::Unavailable)?;
+        .map_err(control_error)?;
     if response.status() != 202 {
         return Err(EnrollmentError::Rejected);
     }
@@ -328,7 +342,7 @@ where
             body,
             signature,
         })
-        .map_err(|_| EnrollmentError::Unavailable)
+        .map_err(control_error)
 }
 
 fn build_agent(config: &EnrollmentConfig) -> Result<ureq::Agent, EnrollmentError> {
@@ -382,6 +396,22 @@ fn trusted_response_expiry(expires_at_ms: u64, now_ms: u64, lifetime_ms: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_refusals_are_not_reported_as_outages() {
+        assert!(matches!(
+            control_error(ureq::Error::StatusCode(503)),
+            EnrollmentError::Refused(503)
+        ));
+        assert_eq!(
+            EnrollmentError::Refused(503).to_string(),
+            "relay control refused the request (HTTP 503)"
+        );
+        assert!(matches!(
+            control_error(ureq::Error::Io(std::io::Error::other("reset"))),
+            EnrollmentError::Unavailable
+        ));
+    }
 
     #[test]
     fn trusted_response_expiry_allows_only_bounded_future_clock_offset() {
