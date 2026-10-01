@@ -32,8 +32,6 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
 
 const CONTROL_SERVER_NAME: &str = "relay-control.bloom.directory";
-const EXPECTED_GATEWAY: &str = "84.32.151.158:443";
-const EXPECTED_INGRESS: &str = "84.32.25.82:443";
 const POLL_LIMIT: Duration = Duration::from_secs(300);
 
 struct Inputs {
@@ -256,8 +254,26 @@ impl Inputs {
         }
         let gateway_text = required("BLOOM_RELAY_SMOKE_GATEWAY_ADDR")?;
         let ingress_text = required("BLOOM_RELAY_SMOKE_INGRESS_ADDR")?;
-        if gateway_text != EXPECTED_GATEWAY || ingress_text != EXPECTED_INGRESS {
-            bail!("gateway or ingress does not match the fixed deployed topology");
+        // The deployed topology: distinct public IPv4 control and ingress
+        // addresses on 443. Deployment addresses stay out of this repository.
+        for (name, text) in [("gateway", &gateway_text), ("ingress", &ingress_text)] {
+            let address: std::net::SocketAddrV4 = text
+                .parse()
+                .with_context(|| format!("{name} must be an IPv4 address and port"))?;
+            let ip = address.ip();
+            if address.port() != 443
+                || ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+            {
+                bail!("{name} must be a public IPv4 address on port 443");
+            }
+        }
+        if gateway_text == ingress_text {
+            bail!("gateway and ingress must be distinct addresses");
         }
         let control_ca = fs::read(required("BLOOM_RELAY_SMOKE_CONTROL_CA_FILE")?)
             .context("control CA read failed")?;

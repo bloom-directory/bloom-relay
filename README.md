@@ -1,9 +1,8 @@
 # bloom-relay
 
-**Status:** implemented v1 under integration testing. Public enrollment remains
-closed and no Triad rollout has occurred. See [deployment evidence](docs/deployments/2026-09-19.md)
-for verified capabilities and outstanding production gates. The design and
-acceptance requirements below remain the implementation contract.
+**Status:** implemented v1. The design and acceptance requirements below
+remain the implementation contract; operating guidance is in
+[`docs/operations.md`](docs/operations.md) and [`docs/package.md`](docs/package.md).
 
 Bloom's relay makes a self-hosted Broker reachable at
 `https://<randomid>.relay.bloom.directory` without inbound ports or user DNS

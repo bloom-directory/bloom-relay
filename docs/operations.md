@@ -1,13 +1,11 @@
-# Relay operations and deployment gates
+# Relay operations
 
-The initial production host is provisioned with public enrollment closed; see
-[deployment evidence](deployments/2026-09-19.md). No DNS, cloud, wallet or
-certificate mutation runs in local tests.
+No DNS, cloud, wallet or certificate mutation runs in local tests.
 The reviewable Linux release templates and role grants are in
 [`package.md`](package.md); their installation and live drills are still
 deployment actions.
 
-Before a production rollout, record the DNS provider and its owning account,
+For each deployment, record the DNS provider and its owning account,
 zone ID and delegation or authoritative-zone decision, optional DNSSEC/DS
 decision, ingress IPv4 and IPv6 addresses, shard placement, PostgreSQL service
 and backup owner, and separate workload identities for gateway, control administration
@@ -44,8 +42,7 @@ the operator reconciles the durable operation before retry. With the S3
 witness configured (see [`package.md`](package.md)), the same rules apply to
 the higher of the local and S3 revisions, so a whole-host rollback or a
 replacement host cannot start below the last acknowledged transition.
-Production recovery still needs independently retained audit/backup evidence
-and a documented restore rehearsal.
+Keep independently retained audit/backup evidence and rehearse restores.
 Do not pass bearer values on command lines or environment variables. Broker
 reads its tunnel credential from an owner-only file. The signed control API
 uses its fixed public TLS origin; metrics and backend management belong on a
@@ -53,8 +50,8 @@ private network.
 Bootstrap challenge issuance is capped at 10 per source IP and 100 globally
 per minute; pending allocations expire after 24 hours. Browser ingress
 admits at most 120 new TLS connections per source IP and 5,000 globally per
-fixed minute. Tune these values from capacity/NAT measurements before public
-opening while retaining Broker's installation and recovery-ID quotas.
+fixed minute. Tune these values from capacity/NAT measurements while
+retaining Broker's installation and recovery-ID quotas.
 In the packaged topology HAProxy terminates public TLS, so the API's TCP peer
 is always HAProxy's loopback address. HAProxy therefore sends each client's
 address with PROXY protocol v2 (`send-proxy-v2`) at the start of its backend
@@ -143,11 +140,10 @@ and contiguous positions with exact hostname and SPKI SHA-256. The worker
 persists checkpoints, expected inventory and unexpected issuance alerts, then
 POSTs them to a separately authenticated HTTPS alert sink with a stable
 idempotency key. A 15-minute feed outage creates a distinct durable lag
-alert. The local HTTPS fixture exercises both deliveries. Production still
-requires selection and review of a real CT source/adapter that validates log
-entries, plus a monitored alert sink and on-call target. Before production,
-exercise a
-drill for unexpected issuance:
+alert. The local HTTPS fixture exercises both deliveries. A deployment
+supplies a reviewed CT source/adapter that validates log entries, plus a
+monitored alert sink and on-call target. Exercise a drill for unexpected
+issuance:
 contain DNS/control credentials, identify affected names, notify owners,
 revoke improper certificates, inspect audit and CT, and verify a legitimate
 rotation does not trigger a false incident. Record audit retention and
@@ -159,8 +155,6 @@ The local test gate uses disposable PostgreSQL 14 and loopback-only TLS. Run
 `BLOOM_RELAY_TEST_DATABASE_URL=postgres://... cargo test --workspace --locked`
 to exercise opaque Browser TLS forwarding, tunnel reconnect fencing, scoped
 credential rotation, DNS challenge leases, stale restore refusal and the CT
-alert fixture. CI provisions the disposable database. The remaining rollout
-work is CT source/adapter and alert destination configuration, real provider
-propagation and failure drills, public ACME staging issuance/renewal, reviewed
-service installation, load and incident drills, and the recorded ownership/configuration above.
-A health endpoint or local fixture alone is not production readiness evidence.
+alert fixture. CI provisions the disposable database. Provider propagation,
+failure, load and incident drills run against a deployment, not in CI; a
+health endpoint or local fixture alone is not readiness evidence.

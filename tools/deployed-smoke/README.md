@@ -12,16 +12,17 @@ the allocated hostname and trusted only by this process. The assigned hostname i
 permanently tombstoned by retirement.
 
 The public bootstrap operator allowlist must admit the machine running the probe.
-Set every variable below; the two addresses are checked against the fixed deployed
-topology before any network operation:
+Set every variable below. The control and ingress addresses must be distinct
+public IPv4 addresses on port 443; deployment addresses are kept out of this
+repository. The examples use documentation addresses:
 
 ```sh
 BLOOM_RELAY_DEPLOYED_SMOKE=1 \
 BLOOM_RELAY_SMOKE_CONTROL_CA_FILE=/restricted/control-ca.pem \
 BLOOM_RELAY_SMOKE_RECEIPT_PUBLIC_KEY_FILE=/restricted/receipt-public-key.hex \
 BLOOM_RELAY_SMOKE_ACME_ACCOUNT_URI_FILE=/restricted/acme-account-uri \
-BLOOM_RELAY_SMOKE_GATEWAY_ADDR=84.32.151.158:443 \
-BLOOM_RELAY_SMOKE_INGRESS_ADDR=84.32.25.82:443 \
+BLOOM_RELAY_SMOKE_GATEWAY_ADDR=192.0.2.10:443 \
+BLOOM_RELAY_SMOKE_INGRESS_ADDR=192.0.2.20:443 \
 cargo run --manifest-path tools/deployed-smoke/Cargo.toml --locked
 ```
 
