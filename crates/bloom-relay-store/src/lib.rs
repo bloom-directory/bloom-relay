@@ -35,6 +35,10 @@ pub enum StoreError {
     Witness(String),
 }
 
+/// How long after expiry the newest scoped credential may still renew
+/// itself. Covers a host asleep or offline through its renewal window.
+pub const RENEWAL_GRACE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -380,8 +384,14 @@ impl Store {
             self.acknowledge().await?;
             return Ok(receipt);
         }
-        let row = sqlx::query("SELECT c.token_hash FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.generation=$3 AND c.revoked_at IS NULL AND c.expires_at>now() AND i.state='dns_ready' FOR UPDATE OF c")
-            .bind(installation_id).bind(scope).bind(generation as i64).fetch_optional(&mut *tx).await?.ok_or(StoreError::Unauthorized)?;
+        // A credential may renew for RENEWAL_GRACE after it expires, so a
+        // Broker that slept through its renewal window recovers on wake. Only
+        // the newest unrevoked credential for the scope qualifies, so a
+        // superseded token can never renew; an expired one still cannot open
+        // a tunnel (`authenticate_bearer` requires an unexpired credential).
+        let row = sqlx::query("SELECT c.token_hash, c.expires_at<=now() AS expired FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.generation=$3 AND c.revoked_at IS NULL AND c.expires_at>now()-make_interval(secs => $4) AND i.state='dns_ready' AND NOT EXISTS (SELECT 1 FROM scoped_bearer_credentials n WHERE n.installation_id=c.installation_id AND n.scope=c.scope AND n.generation>c.generation) FOR UPDATE OF c")
+            .bind(installation_id).bind(scope).bind(generation as i64).bind(RENEWAL_GRACE.as_secs_f64()).fetch_optional(&mut *tx).await?.ok_or(StoreError::Unauthorized)?;
+        let renewed_after_expiry: bool = row.get("expired");
         let observed: Vec<u8> = row.get("token_hash");
         if observed != old_hash.as_slice() {
             return Err(StoreError::Unauthorized);
@@ -403,8 +413,18 @@ impl Store {
         sqlx::query("INSERT INTO operations(operation_id,installation_id,kind,request_digest,result) VALUES ($1,$2,$3,$4,$5)")
             .bind(operation_id).bind(installation_id).bind(format!("renew:{scope}")).bind(request_digest.as_slice())
             .bind(serde_json::json!({"generation":next,"expires_at_ms":expires_at_ms})).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'credential_renewed')")
-            .bind(installation_id).bind(operation_id).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,$3)",
+        )
+        .bind(installation_id)
+        .bind(operation_id)
+        .bind(if renewed_after_expiry {
+            "credential_renewed_after_expiry"
+        } else {
+            "credential_renewed"
+        })
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         self.acknowledge().await?;
         Ok((next as u64, expires_at_ms as u64))
