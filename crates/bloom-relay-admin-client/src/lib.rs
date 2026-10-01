@@ -20,7 +20,8 @@ const CONTROL_ORIGIN: &str = "https://relay-control.bloom.directory";
 const CONTROL_AUDIENCE: &str = "relay-control.bloom.directory";
 
 pub struct EnrollmentConfig {
-    /// Pinned PEM trust anchor for the relay control service.
+    /// Pinned PEM trust anchors for the relay control service: one or more
+    /// root certificates, any of which may issue the control certificate.
     pub control_ca_pem: Vec<u8>,
 }
 
@@ -73,12 +74,13 @@ fn control_error(error: ureq::Error) -> EnrollmentError {
     }
 }
 
-/// The caller owns the protected admin key and relay receipt verification key.
-/// No hostname or origin is accepted from an untrusted response without proof.
+/// The caller owns the protected admin key and the pinned relay receipt
+/// verification keys; a receipt signed by any of them is accepted. No hostname
+/// or origin is accepted from an untrusted response without proof.
 pub fn enroll<F>(
     config: EnrollmentConfig,
     admin_public_key: &[u8; 32],
-    relay_receipt_public_key: &[u8; 32],
+    relay_receipt_public_keys: &[[u8; 32]],
     operation_id: Uuid,
     sign: F,
 ) -> Result<AllocationReceipt, EnrollmentError>
@@ -135,7 +137,7 @@ where
     )?;
     receipt
         .verify_bytes(
-            relay_receipt_public_key,
+            relay_receipt_public_keys,
             operation_id,
             admin_public_key,
             now_ms(),
@@ -345,9 +347,21 @@ where
         .map_err(control_error)
 }
 
+/// Every certificate in a PEM bundle; `None` if it holds none or any is
+/// malformed, so a damaged pin file never silently narrows to fewer roots.
+fn pinned_roots(pem: &[u8]) -> Option<Vec<ureq::tls::Certificate<'static>>> {
+    let mut roots = Vec::new();
+    for item in ureq::tls::parse_pem(pem) {
+        match item.ok()? {
+            ureq::tls::PemItem::Certificate(cert) => roots.push(cert),
+            _ => return None,
+        }
+    }
+    (!roots.is_empty()).then_some(roots)
+}
+
 fn build_agent(config: &EnrollmentConfig) -> Result<ureq::Agent, EnrollmentError> {
-    let ca = ureq::tls::Certificate::from_pem(&config.control_ca_pem)
-        .map_err(|_| EnrollmentError::InvalidTrust)?;
+    let roots = pinned_roots(&config.control_ca_pem).ok_or(EnrollmentError::InvalidTrust)?;
     Ok(ureq::config::Config::builder()
         .https_only(true)
         .max_redirects(0)
@@ -356,7 +370,7 @@ fn build_agent(config: &EnrollmentConfig) -> Result<ureq::Agent, EnrollmentError
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::Rustls)
-                .root_certs(ureq::tls::RootCerts::new_with_certs(&[ca]))
+                .root_certs(ureq::tls::RootCerts::new_with_certs(&roots))
                 .build(),
         )
         .build()
@@ -396,6 +410,21 @@ fn trusted_response_expiry(expires_at_ms: u64, now_ms: u64, lifetime_ms: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_roots_load_every_certificate_or_none() {
+        let bundle = include_bytes!("../../../testdata/isrg-roots.pem");
+        assert_eq!(pinned_roots(bundle).unwrap().len(), 2);
+        let mut damaged = bundle.to_vec();
+        damaged.extend_from_slice(
+            b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+        );
+        assert!(pinned_roots(&damaged).is_none());
+        assert!(pinned_roots(b"").is_none());
+        let mut with_key = bundle.to_vec();
+        with_key.extend_from_slice(b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\n");
+        assert!(pinned_roots(&with_key).is_none());
+    }
 
     #[test]
     fn http_refusals_are_not_reported_as_outages() {

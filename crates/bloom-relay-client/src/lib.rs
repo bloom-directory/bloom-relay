@@ -102,12 +102,28 @@ pub async fn renew_scoped_credential(
     .map_err(|_| ClientError::Transport)?
 }
 
+/// Every certificate in a PEM bundle (the pinned control roots). A bundle
+/// with no certificate, or any malformed or non-certificate item, is refused
+/// rather than silently narrowed.
+fn pinned_roots(pem: &[u8]) -> Result<Vec<ureq::tls::Certificate<'static>>, ClientError> {
+    let mut roots = Vec::new();
+    for item in ureq::tls::parse_pem(pem) {
+        match item.map_err(|_| ClientError::InvalidConfiguration)? {
+            ureq::tls::PemItem::Certificate(cert) => roots.push(cert),
+            _ => return Err(ClientError::InvalidConfiguration),
+        }
+    }
+    if roots.is_empty() {
+        return Err(ClientError::InvalidConfiguration);
+    }
+    Ok(roots)
+}
+
 fn pinned_control_agent(ca: &[u8]) -> Result<ureq::Agent, ClientError> {
-    let cert =
-        ureq::tls::Certificate::from_pem(ca).map_err(|_| ClientError::InvalidConfiguration)?;
+    let roots = pinned_roots(ca)?;
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
-        .root_certs(ureq::tls::RootCerts::new_with_certs(&[cert]))
+        .root_certs(ureq::tls::RootCerts::new_with_certs(&roots))
         .build();
     Ok(ureq::config::Config::builder()
         .https_only(true)
@@ -501,9 +517,7 @@ pub async fn probe_public_health(
     tokio::task::spawn_blocking(move || {
         let mut tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls);
         if let Some(pem) = test_ca_pem {
-            let cert = ureq::tls::Certificate::from_pem(&pem)
-                .map_err(|_| ClientError::InvalidConfiguration)?;
-            tls = tls.root_certs(ureq::tls::RootCerts::new_with_certs(&[cert]));
+            tls = tls.root_certs(ureq::tls::RootCerts::new_with_certs(&pinned_roots(&pem)?));
         }
         let agent = ureq::config::Config::builder()
             .https_only(true)
@@ -664,6 +678,21 @@ fn trusted_response_expiry(expires_at_ms: u64, now_ms: u64, lifetime_ms: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_roots_load_every_certificate_or_none() {
+        let bundle = include_bytes!("../../../testdata/isrg-roots.pem");
+        assert_eq!(pinned_roots(bundle).unwrap().len(), 2);
+        let mut damaged = bundle.to_vec();
+        damaged.extend_from_slice(
+            b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+        );
+        assert!(pinned_roots(&damaged).is_err());
+        assert!(pinned_roots(b"").is_err());
+        let mut with_key = bundle.to_vec();
+        with_key.extend_from_slice(b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\n");
+        assert!(pinned_roots(&with_key).is_err());
+    }
 
     #[test]
     fn http_refusals_are_not_reported_as_transport_failures() {
