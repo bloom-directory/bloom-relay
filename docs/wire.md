@@ -2,7 +2,10 @@
 
 All control requests use HTTPS to the fixed `relay-control.bloom.directory`
 audience. The control endpoint has its own certificate. The Signer pins its
-trust anchor and the Ed25519 relay receipt verification key separately.
+trust anchors and the Ed25519 relay receipt verification keys separately, each
+as a set: a PEM bundle of root certificates, any of which may issue the control
+certificate, and the current receipt key with its pre-published successor, so
+the relay can move to the successor without an urgent client update.
 Version mismatches fail closed. Broker's browser certificate is distinct and
 never leaves Broker.
 

@@ -241,16 +241,25 @@ impl AllocationReceipt {
             .map_err(|_| ProtocolError::InvalidSignature)
     }
 
+    /// Verifies against a pinned set of relay receipt keys (the current key
+    /// and its pre-published successor); any one of them may have signed.
     pub fn verify_bytes(
         &self,
-        relay_public_key: &[u8; 32],
+        relay_public_keys: &[[u8; 32]],
         operation_id: Uuid,
         admin_public_key: &[u8; 32],
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
-        let key = VerifyingKey::from_bytes(relay_public_key)
-            .map_err(|_| ProtocolError::InvalidSignature)?;
-        self.verify(&key, operation_id, admin_public_key, now_ms)
+        let mut result = Err(ProtocolError::InvalidSignature);
+        for relay_public_key in relay_public_keys {
+            let key = VerifyingKey::from_bytes(relay_public_key)
+                .map_err(|_| ProtocolError::InvalidSignature)?;
+            result = self.verify(&key, operation_id, admin_public_key, now_ms);
+            if !matches!(result, Err(ProtocolError::InvalidSignature)) {
+                return result;
+            }
+        }
+        result
     }
 }
 
@@ -453,6 +462,58 @@ pub fn validate_hostname(hostname: &str) -> Result<(), ProtocolError> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn allocation_receipts_verify_against_any_pinned_key() {
+        let current = SigningKey::from_bytes(&[1; 32]);
+        let next = SigningKey::from_bytes(&[2; 32]);
+        let stranger = SigningKey::from_bytes(&[3; 32]);
+        let admin = [4u8; 32];
+        let operation_id = Uuid::from_u128(5);
+        let now = 1_000_000;
+        let pins = [
+            current.verifying_key().to_bytes(),
+            next.verifying_key().to_bytes(),
+        ];
+        let signed_by = |key: &SigningKey| {
+            let mut receipt = AllocationReceipt {
+                allocation: Allocation {
+                    version: WIRE_VERSION,
+                    installation_id: Uuid::from_u128(6),
+                    hostname: "abcdefghijklmnopqrstuvwxyz.relay.bloom.directory".into(),
+                    placement: "relay-test".into(),
+                    state: AllocationState::PendingDns,
+                },
+                operation_id,
+                admin_key_sha256: sha256_hex(&admin),
+                issued_at_ms: now,
+                signature: String::new(),
+            };
+            receipt.signature =
+                URL_SAFE_NO_PAD.encode(key.sign(&receipt.signed_bytes().unwrap()).to_bytes());
+            receipt
+        };
+        for key in [&current, &next] {
+            assert!(
+                signed_by(key)
+                    .verify_bytes(&pins, operation_id, &admin, now)
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            signed_by(&stranger).verify_bytes(&pins, operation_id, &admin, now),
+            Err(ProtocolError::InvalidSignature)
+        ));
+        assert!(
+            signed_by(&current)
+                .verify_bytes(&[], operation_id, &admin, now)
+                .is_err()
+        );
+        assert!(matches!(
+            signed_by(&next).verify_bytes(&pins, Uuid::from_u128(7), &admin, now),
+            Err(ProtocolError::Unauthorized)
+        ));
+    }
 
     #[test]
     fn signed_claims_reject_wrong_scope_body_and_deadline() {
