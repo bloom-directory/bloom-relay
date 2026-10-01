@@ -412,12 +412,16 @@ async fn challenge_jobs_decode_active_expired_and_deleted_leases() {
         )
         .await
         .unwrap();
-    assert!(
+    // A newer active lease must not suppress cleanup of the old lease's own
+    // record (providers delete by lease, never the newer value).
+    assert_eq!(
         store
             .challenge_for_job(id, expired_id, true)
             .await
             .unwrap()
-            .is_none()
+            .unwrap()
+            .txt_value,
+        "e".repeat(43)
     );
     store
         .delete_challenge(id, generation, deleted_id)
@@ -899,4 +903,107 @@ async fn the_newest_credential_renews_within_the_grace_period_after_expiry() {
             .await,
         Err(StoreError::Unauthorized)
     ));
+}
+
+#[tokio::test]
+async fn consumed_bootstrap_challenges_stay_counted_until_pruned() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+    let octets = Uuid::new_v4().into_bytes();
+    let busy: std::net::IpAddr = [10, octets[0], octets[1], octets[2]].into();
+    let enrolled: std::net::IpAddr = [10, octets[3], octets[4], octets[5]].into();
+    let nonce = |i: usize| format!("{}-{i}", Uuid::new_v4());
+
+    // Ten per source per minute; consuming them does not free the quota.
+    let issued: Vec<String> = (0..10).map(nonce).collect();
+    for value in &issued {
+        assert!(store.create_bootstrap_challenge(value, busy).await.unwrap());
+    }
+    assert!(
+        !store
+            .create_bootstrap_challenge(&nonce(10), busy)
+            .await
+            .unwrap()
+    );
+    for value in &issued {
+        assert!(
+            store
+                .consume_bootstrap_challenge(value, busy)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .consume_bootstrap_challenge(value, busy)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(
+        !store
+            .create_bootstrap_challenge(&nonce(11), busy)
+            .await
+            .unwrap()
+    );
+
+    // Twenty completed enrollments per source per day.
+    for i in 0..20 {
+        sqlx::query("INSERT INTO bootstrap_challenges(nonce,source_ip,expires_at,created_at,consumed_at) VALUES ($1,$2::inet,now()-interval '119 minutes',now()-interval '2 hours',now()-interval '2 hours')")
+            .bind(nonce(i)).bind(enrolled.to_string()).execute(store.pool()).await.unwrap();
+    }
+    assert!(
+        !store
+            .create_bootstrap_challenge(&nonce(20), enrolled)
+            .await
+            .unwrap()
+    );
+
+    // History older than two days and expired replay nonces are pruned.
+    sqlx::query("UPDATE bootstrap_challenges SET created_at=now()-interval '3 days' WHERE source_ip=$1::inet")
+        .bind(enrolled.to_string()).execute(store.pool()).await.unwrap();
+    let allocation = store
+        .allocate(Uuid::new_v4(), [6u8; 32], "bootstrap-prune-test")
+        .await
+        .unwrap();
+    let stale = nonce(30);
+    assert!(
+        store
+            .consume_nonce(allocation.installation_id, &stale)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE used_nonces SET expires_at=now()-interval '1 second' WHERE nonce=$1")
+        .bind(&stale)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    while store.prune_bootstrap_and_nonces(10_000).await.unwrap() > 0 {}
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM bootstrap_challenges WHERE source_ip=$1::inet")
+            .bind(enrolled.to_string())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
+    assert!(
+        store
+            .create_bootstrap_challenge(&nonce(21), enrolled)
+            .await
+            .unwrap()
+    );
+    let kept: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM bootstrap_challenges WHERE source_ip=$1::inet")
+            .bind(busy.to_string())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(kept, 10);
+    let nonces: i64 = sqlx::query_scalar("SELECT count(*) FROM used_nonces WHERE nonce=$1")
+        .bind(&stale)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(nonces, 0);
 }

@@ -191,17 +191,25 @@ impl Store {
         Ok(pristine)
     }
 
+    /// Issues a bootstrap challenge unless the source or the relay is over
+    /// quota: 10 per source and 100 overall per minute, and 20 completed
+    /// enrollments per source per day. Consumed challenges stay counted, and a
+    /// transaction lock serializes the count and insert.
     pub async fn create_bootstrap_challenge(
         &self,
         nonce: &str,
         source: IpAddr,
     ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT (SELECT count(*) FROM bootstrap_challenges WHERE source_ip=$1::inet AND created_at>now()-interval '1 minute') AS local_count, (SELECT count(*) FROM bootstrap_challenges WHERE created_at>now()-interval '1 minute') AS global_count")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('bloom-relay/bootstrap-quota'))")
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query("SELECT (SELECT count(*) FROM bootstrap_challenges WHERE source_ip=$1::inet AND created_at>now()-interval '1 minute') AS local_count, (SELECT count(*) FROM bootstrap_challenges WHERE created_at>now()-interval '1 minute') AS global_count, (SELECT count(*) FROM bootstrap_challenges WHERE source_ip=$1::inet AND created_at>now()-interval '1 day 1 minute' AND consumed_at>now()-interval '1 day') AS daily_enrollments")
             .bind(source.to_string()).fetch_one(&mut *tx).await?;
         let local: i64 = row.get("local_count");
         let global: i64 = row.get("global_count");
-        if local >= 10 || global >= 100 {
+        let daily: i64 = row.get("daily_enrollments");
+        if local >= 10 || global >= 100 || daily >= 20 {
             return Ok(false);
         }
         sqlx::query("INSERT INTO bootstrap_challenges(nonce,source_ip,expires_at) VALUES ($1,$2::inet,now()+interval '1 minute')")
@@ -216,9 +224,23 @@ impl Store {
         nonce: &str,
         source: IpAddr,
     ) -> Result<bool, StoreError> {
-        let changed = sqlx::query("DELETE FROM bootstrap_challenges WHERE nonce=$1 AND source_ip=$2::inet AND expires_at>now()")
+        let changed = sqlx::query("UPDATE bootstrap_challenges SET consumed_at=now() WHERE nonce=$1 AND source_ip=$2::inet AND expires_at>now() AND consumed_at IS NULL")
             .bind(nonce).bind(source.to_string()).execute(&self.pool).await?.rows_affected();
         Ok(changed == 1)
+    }
+
+    /// Removes bootstrap challenge history older than the quota windows and
+    /// expired replay nonces, at most `limit` rows of each per call.
+    pub async fn prune_bootstrap_and_nonces(&self, limit: i64) -> Result<u64, StoreError> {
+        if !(1..=10_000).contains(&limit) {
+            return Err(StoreError::InvalidRequest);
+        }
+        let challenges = sqlx::query("DELETE FROM bootstrap_challenges WHERE nonce IN (SELECT nonce FROM bootstrap_challenges WHERE created_at<now()-interval '2 days' ORDER BY created_at LIMIT $1)")
+            .bind(limit).execute(&self.pool).await?.rows_affected();
+        let nonces = sqlx::query("DELETE FROM used_nonces WHERE (installation_id,nonce) IN (SELECT installation_id,nonce FROM used_nonces WHERE expires_at<now() ORDER BY expires_at LIMIT $1)")
+            .bind(limit).execute(&self.pool).await?.rows_affected();
+        self.acknowledge().await?;
+        Ok(challenges + nonces)
     }
 
     pub async fn admin_public_key(
@@ -603,13 +625,8 @@ impl Store {
         lease_id: Uuid,
         cleanup: bool,
     ) -> Result<Option<ChallengeLease>, StoreError> {
-        if cleanup {
-            let active: i64 = sqlx::query_scalar("SELECT count(*) FROM challenge_leases WHERE installation_id=$1 AND lease_id<>$2 AND deleted_at IS NULL AND expires_at>now()")
-                .bind(installation_id).bind(lease_id).fetch_one(&self.pool).await?;
-            if active > 0 {
-                return Ok(None);
-            }
-        }
+        // Cleanup always targets this lease's own record, even while a newer
+        // lease is active: the providers delete by lease, never a newer value.
         let row = sqlx::query("SELECT txt_value,(extract(epoch FROM expires_at)*1000)::bigint AS expiry FROM challenge_leases WHERE installation_id=$1 AND lease_id=$2 AND ($3 OR (deleted_at IS NULL AND expires_at>now()))")
             .bind(installation_id).bind(lease_id).bind(cleanup).fetch_optional(&self.pool).await?;
         let Some(row) = row else {

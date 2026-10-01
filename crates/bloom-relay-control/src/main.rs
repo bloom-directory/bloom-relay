@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bloom_relay_protocol::{
-    AcmeAccountRequest, AcmeEnvironment, AllocateRequest, Allocation, AllocationReceipt,
+    AcmeAccountRequest, AcmeEnvironment, Action, AllocateRequest, Allocation, AllocationReceipt,
     BootstrapChallenge, CertificateMetadata, CredentialIssueReceipt, CredentialIssueRequest,
     CredentialRenewRequest, DnsChallengeDeleteRequest, DnsChallengeRequest, ErrorCode,
     ErrorEnvelope, InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION,
@@ -180,6 +180,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Err(error) = sweeper_store.expire_challenge_leases(100).await {
                 tracing::warn!(%error, "challenge lease sweep failed");
             }
+            if let Err(error) = sweeper_store.prune_bootstrap_and_nonces(1_000).await {
+                tracing::warn!(%error, "bootstrap and nonce prune failed");
+            }
             if let Ok(Some(seconds)) = sqlx::query_scalar::<_, Option<f64>>(
                 "SELECT min(extract(epoch FROM not_after-now()))::double precision FROM certificate_inventory",
             )
@@ -275,9 +278,12 @@ async fn authenticate_dns(
     Ok(observed)
 }
 
+/// Verifies an installation administrator's signature for exactly `action`
+/// and consumes its nonce.
 async fn authorize_admin<T: serde::Serialize>(
     state: &AppState,
     request: &SignedRequest<T>,
+    action: Action,
 ) -> Result<(), ApiError> {
     let installation_id = request.claims.installation_id;
     let Some(bytes) = state
@@ -296,7 +302,7 @@ async fn authorize_admin<T: serde::Serialize>(
             &body,
             &request.signature,
             &key,
-            Scope::SurfaceAdmin,
+            (Scope::SurfaceAdmin, action),
             &state.audience,
             now_ms(),
         )
@@ -323,7 +329,7 @@ async fn installation_status(
     if request.body.installation_id != request.claims.installation_id {
         return Err(unauthorized());
     }
-    authorize_admin(&state, &request).await?;
+    authorize_admin(&state, &request, Action::InstallationStatus).await?;
     let allocation = state
         .store
         .allocation_status(request.body.installation_id)
@@ -340,7 +346,7 @@ async fn retire_installation(
     if request.body.installation_id != request.claims.installation_id {
         return Err(unauthorized());
     }
-    authorize_admin(&state, &request).await?;
+    authorize_admin(&state, &request, Action::RetireInstallation).await?;
     state
         .store
         .retire(request.body.installation_id, request.claims.operation_id)
@@ -359,39 +365,7 @@ async fn register_acme_account(
     Json(request): Json<SignedRequest<AcmeAccountRequest>>,
 ) -> Result<StatusCode, ApiError> {
     let installation_id = request.claims.installation_id;
-    let Some(bytes) = state
-        .store
-        .admin_public_key(installation_id)
-        .await
-        .map_err(|_| unavailable())?
-    else {
-        return Err(unauthorized());
-    };
-    let key = VerifyingKey::from_bytes(&bytes).map_err(|_| unavailable())?;
-    let body = serde_jcs::to_vec(&request.body).map_err(|_| invalid())?;
-    request
-        .claims
-        .verify(
-            &body,
-            &request.signature,
-            &key,
-            Scope::SurfaceAdmin,
-            &state.audience,
-            now_ms(),
-        )
-        .map_err(|_| unauthorized())?;
-    if !state
-        .store
-        .consume_nonce(installation_id, &request.claims.nonce)
-        .await
-        .map_err(|_| unavailable())?
-    {
-        return Err(ApiError(
-            StatusCode::GONE,
-            ErrorCode::ExpiredOrReplayed,
-            false,
-        ));
-    }
+    authorize_admin(&state, &request, Action::RegisterAcmeAccount).await?;
     state
         .store
         .register_acme_account(installation_id, &request.body.account_uri)
@@ -631,7 +605,7 @@ async fn enroll(
             &body,
             &request.signature,
             &key,
-            Scope::SurfaceAdmin,
+            (Scope::SurfaceAdmin, Action::Enroll),
             &state.audience,
             now_ms(),
         )
@@ -682,39 +656,7 @@ async fn issue_credential(
     if !matches!(request.body.scope, Scope::Tunnel | Scope::DnsChallenge) {
         return Err(invalid());
     }
-    let Some(bytes) = state
-        .store
-        .admin_public_key(request.claims.installation_id)
-        .await
-        .map_err(|_| unavailable())?
-    else {
-        return Err(unauthorized());
-    };
-    let key = VerifyingKey::from_bytes(&bytes).map_err(|_| unavailable())?;
-    let body = serde_jcs::to_vec(&request.body).map_err(|_| invalid())?;
-    request
-        .claims
-        .verify(
-            &body,
-            &request.signature,
-            &key,
-            Scope::SurfaceAdmin,
-            &state.audience,
-            now_ms(),
-        )
-        .map_err(|_| unauthorized())?;
-    if !state
-        .store
-        .consume_nonce(request.claims.installation_id, &request.claims.nonce)
-        .await
-        .map_err(|_| unavailable())?
-    {
-        return Err(ApiError(
-            StatusCode::GONE,
-            ErrorCode::ExpiredOrReplayed,
-            false,
-        ));
-    }
+    authorize_admin(&state, &request, Action::IssueCredential).await?;
     let hash = hex::decode(&request.body.token_sha256).map_err(|_| invalid())?;
     let hash: [u8; 32] = hash.try_into().map_err(|_| invalid())?;
     let scope = if request.body.scope == Scope::Tunnel {
@@ -778,6 +720,7 @@ mod tests {
         installation_id: Uuid,
         operation_id: Uuid,
         body: T,
+        action: Action,
         key: &SigningKey,
     ) -> SignedRequest<T> {
         let canonical = serde_jcs::to_vec(&body).unwrap();
@@ -785,6 +728,7 @@ mod tests {
             version: WIRE_VERSION,
             installation_id,
             scope: Scope::SurfaceAdmin,
+            action,
             generation: 0,
             audience: "relay-control.bloom.directory".into(),
             operation_id,
@@ -846,6 +790,7 @@ mod tests {
             InstallationStatusRequest {
                 installation_id: Uuid::new_v4(),
             },
+            Action::InstallationStatus,
             &key,
         );
         assert_eq!(
@@ -860,6 +805,7 @@ mod tests {
             InstallationStatusRequest {
                 installation_id: id,
             },
+            Action::InstallationStatus,
             &key,
         );
         let response = send(app.clone(), "/v1/installations/status", status).await;
@@ -868,6 +814,27 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(observed.hostname, allocation.hostname);
+        // A status signature, though its body is byte-identical to a
+        // retirement's, never retires the installation.
+        let status_for_retire = signed(
+            id,
+            Uuid::new_v4(),
+            InstallationStatusRequest {
+                installation_id: id,
+            },
+            Action::InstallationStatus,
+            &key,
+        );
+        assert_eq!(
+            send(app.clone(), "/v1/installations/retire", status_for_retire)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(matches!(
+            store.allocation_status(id).await.unwrap().unwrap().state,
+            bloom_relay_protocol::AllocationState::PendingDns
+        ));
         let retirement = Uuid::new_v4();
         assert_eq!(
             send(
@@ -879,6 +846,7 @@ mod tests {
                     RetireRequest {
                         installation_id: id
                     },
+                    Action::RetireInstallation,
                     &key
                 )
             )
@@ -896,6 +864,7 @@ mod tests {
                     RetireRequest {
                         installation_id: id
                     },
+                    Action::RetireInstallation,
                     &key
                 )
             )
@@ -912,6 +881,7 @@ mod tests {
                 InstallationStatusRequest {
                     installation_id: id,
                 },
+                Action::InstallationStatus,
                 &key,
             ),
         )

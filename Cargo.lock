@@ -864,6 +864,7 @@ name = "bloom-relay-dns"
 version = "0.1.0"
 dependencies = [
  "aws-sdk-route53",
+ "aws-smithy-mocks",
  "bloom-relay-protocol",
  "hickory-resolver",
  "reqwest",

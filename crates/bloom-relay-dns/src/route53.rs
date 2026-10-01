@@ -180,9 +180,16 @@ impl Provider for Route53Provider {
         }) else {
             return Ok(());
         };
-        if record.resource_records().len() != 1
-            || record.resource_records()[0].value() != format!("\"{}\"", lease.value)
+        let quoted = format!("\"{}\"", lease.value);
+        if !record
+            .resource_records()
+            .iter()
+            .any(|value| value.value() == quoted)
         {
+            // A newer lease's UPSERT already replaced this value.
+            return Ok(());
+        }
+        if record.resource_records().len() != 1 {
             return Err(DnsError::Conflict);
         }
         self.apply(vec![
@@ -261,6 +268,99 @@ impl Provider for Route53Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_route53::{
+        Client,
+        operation::{
+            change_resource_record_sets::ChangeResourceRecordSetsOutput,
+            list_resource_record_sets::ListResourceRecordSetsOutput,
+        },
+        types::{ChangeInfo, ChangeStatus},
+    };
+    use aws_smithy_mocks::{MockResponseInterceptor, Rule, RuleMode, mock};
+
+    const HOST: &str = "abcdefghijklmnopqrstuv2345.relay.bloom.directory";
+
+    /// A client answered only by `rules`. Built by hand: the SDK's
+    /// `test-util` feature would pull a second, legacy HTTP stack.
+    fn mocked(rules: &[&Rule]) -> Route53Provider {
+        let interceptor = rules.iter().fold(
+            MockResponseInterceptor::new().rule_mode(RuleMode::MatchAny),
+            |interceptor, rule| interceptor.with_rule(rule),
+        );
+        let config = aws_sdk_route53::Config::builder()
+            .behavior_version(aws_sdk_route53::config::BehaviorVersion::latest())
+            .region(aws_sdk_route53::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_route53::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .http_client(aws_smithy_mocks::create_mock_http_client())
+            .interceptor(interceptor)
+            .build();
+        Route53Provider::new(Client::from_conf(config), "Z123".into()).unwrap()
+    }
+
+    fn published(value: &str) -> ListResourceRecordSetsOutput {
+        ListResourceRecordSetsOutput::builder()
+            .resource_record_sets(
+                ResourceRecordSet::builder()
+                    .name(format!("_acme-challenge.{HOST}."))
+                    .r#type(RrType::Txt)
+                    .ttl(30)
+                    .resource_records(
+                        ResourceRecord::builder()
+                            .value(format!("\"{value}\""))
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .is_truncated(false)
+            .max_items(2)
+            .build()
+            .unwrap()
+    }
+
+    fn lease(value: &str) -> TxtLease {
+        TxtLease {
+            hostname: HOST.into(),
+            lease_id: "old".into(),
+            value: value.into(),
+            expires_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_its_own_value_and_leaves_a_newer_lease() {
+        let newer = mock!(Client::list_resource_record_sets).then_output(|| published("new"));
+        let provider = mocked(&[&newer]);
+        // Only the list rule exists: any change request would fail the call.
+        provider.delete_txt(&lease("old")).await.unwrap();
+
+        let own = mock!(Client::list_resource_record_sets).then_output(|| published("old"));
+        let delete = mock!(Client::change_resource_record_sets)
+            .match_requests(|request| {
+                request.change_batch().is_some_and(|batch| {
+                    batch.changes().len() == 1
+                        && batch.changes()[0].action() == &ChangeAction::Delete
+                })
+            })
+            .then_output(|| {
+                ChangeResourceRecordSetsOutput::builder()
+                    .change_info(
+                        ChangeInfo::builder()
+                            .id("C1")
+                            .status(ChangeStatus::Pending)
+                            .submitted_at(aws_sdk_route53::primitives::DateTime::from_secs(0))
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+            });
+        let provider = mocked(&[&own, &delete]);
+        provider.delete_txt(&lease("old")).await.unwrap();
+        assert_eq!(delete.num_calls(), 1);
+    }
     #[test]
     fn provider_changes_are_exact_and_bounded() {
         assert!(

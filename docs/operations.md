@@ -53,7 +53,10 @@ reads its tunnel credential from an owner-only file. The signed control API
 uses its fixed public TLS origin; metrics and backend management belong on a
 private network.
 Bootstrap challenge issuance is capped at 10 per source IP and 100 globally
-per minute; pending allocations expire after 24 hours. Browser ingress
+per minute, and at 20 completed enrollments per source IP per day. Consumed
+challenges stay counted; the API sweeper prunes challenge history after two
+days and replay nonces once they expire. Pending allocations expire after 24
+hours. Browser ingress
 admits at most 120 new TLS connections per source IP and 5,000 globally per
 fixed minute. Tune these values from capacity/NAT measurements while
 retaining Broker's installation and recovery-ID quotas.

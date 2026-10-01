@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     let receipt = enroll(
         enrollment_config(&inputs),
         admin_key.verifying_key().as_bytes(),
-        &inputs.receipt_key,
+        std::slice::from_ref(&inputs.receipt_key),
         operation_id,
         signer(&admin_key),
     )

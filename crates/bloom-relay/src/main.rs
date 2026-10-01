@@ -56,6 +56,10 @@ struct Gateway {
 
 const MAX_TUNNEL_LIFECYCLES: usize = 5_000;
 const MAX_TUNNEL_LIFECYCLES_PER_CONNECTION: usize = 256;
+/// Bound on the HTTP/2 handshake after TLS on a control connection.
+const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A control connection must carry an authenticated request within this.
+const CONTROL_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct IngressQuota {
     state: StdMutex<(Instant, u32, HashMap<IpAddr, u32>)>,
@@ -187,6 +191,13 @@ async fn main() -> Result<(), Error> {
                     }
                 });
             }
+            // Reap finished connections as they complete; a JoinSet keeps
+            // every task until it is joined.
+            Some(finished) = connections.join_next(), if !connections.is_empty() => {
+                if finished.is_err() {
+                    bloom_relay_observe::count("bloom_relay_connection_task_failed_total");
+                }
+            }
             _ = shutdown_signal() => break,
         }
     }
@@ -248,7 +259,7 @@ async fn control_connection(
     if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
         return Err("HTTP/2 required".into());
     }
-    let connection = server::handshake(tls).await?;
+    let connection = timeout(CONTROL_HANDSHAKE_TIMEOUT, server::handshake(tls)).await??;
     let (connection_shutdown, _) = watch::channel(false);
     let mut lifecycles = JoinSet::new();
     let result = serve_control_connection(
@@ -256,6 +267,7 @@ async fn control_connection(
         connection,
         connection_shutdown.clone(),
         &mut lifecycles,
+        CONTROL_AUTHENTICATION_TIMEOUT,
     )
     .await;
     connection_shutdown.send_replace(true);
@@ -268,11 +280,20 @@ async fn serve_control_connection<T>(
     mut connection: server::Connection<T, Bytes>,
     connection_shutdown: watch::Sender<bool>,
     lifecycles: &mut JoinSet<()>,
+    authentication_timeout: Duration,
 ) -> Result<(), Error>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let local_lifecycles = Arc::new(Semaphore::new(MAX_TUNNEL_LIFECYCLES_PER_CONNECTION));
+    // Each connection holds one of the gateway's control slots. Until it
+    // carries an authenticated request it may hold that slot only briefly, so
+    // stalled or unauthenticated peers cannot exhaust the slots. Afterwards it
+    // may idle: attach streams are not tracked here, and the proxy in front
+    // pools connections.
+    let authentication_deadline = tokio::time::sleep(authentication_timeout);
+    tokio::pin!(authentication_deadline);
+    let mut authenticated = false;
     loop {
         let request = tokio::select! {
             request = connection.accept() => request,
@@ -281,6 +302,10 @@ where
                     bloom_relay_observe::count("bloom_relay_tunnel_lifecycle_failed_total");
                 }
                 continue;
+            }
+            () = &mut authentication_deadline, if !authenticated => {
+                bloom_relay_observe::count("bloom_relay_control_unauthenticated_closed_total");
+                return Ok(());
             }
         };
         let Some(request) = request else {
@@ -328,6 +353,7 @@ where
                 )?;
                 continue;
             }
+            authenticated = true;
             let id = id.ok_or("missing installation")?;
             let host = host.ok_or("missing hostname")?;
             let Ok(local_permit) = local_lifecycles.clone().try_acquire_owned() else {
@@ -423,31 +449,34 @@ where
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.strip_prefix("Bearer "));
-            let authenticated = if let (Some(id), Some(host), Some(generation), Some(token)) =
-                (id, host, generation, token)
-            {
-                version == Some(WIRE_VERSION)
-                    && validate_hostname(host).is_ok()
-                    && gateway.store.hostname(id).await?.as_deref() == Some(host)
-                    && gateway
-                        .store
-                        .authenticate_bearer(id, "tunnel", token)
-                        .await?
-                        .is_some()
-                    && gateway
-                        .tunnels
-                        .lock()
-                        .await
-                        .get(host)
-                        .is_some_and(|tunnel| tunnel.id == id && tunnel.generation == generation)
-                    && gateway
-                        .store
-                        .tunnel_is_current(id, &gateway.gateway_id, generation)
-                        .await?
-            } else {
-                false
-            };
-            if !authenticated {
+            let attach_authenticated =
+                if let (Some(id), Some(host), Some(generation), Some(token)) =
+                    (id, host, generation, token)
+                {
+                    version == Some(WIRE_VERSION)
+                        && validate_hostname(host).is_ok()
+                        && gateway.store.hostname(id).await?.as_deref() == Some(host)
+                        && gateway
+                            .store
+                            .authenticate_bearer(id, "tunnel", token)
+                            .await?
+                            .is_some()
+                        && gateway
+                            .tunnels
+                            .lock()
+                            .await
+                            .get(host)
+                            .is_some_and(|tunnel| {
+                                tunnel.id == id && tunnel.generation == generation
+                            })
+                        && gateway
+                            .store
+                            .tunnel_is_current(id, &gateway.gateway_id, generation)
+                            .await?
+                } else {
+                    false
+                };
+            if !attach_authenticated {
                 response.send_response(
                     Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
@@ -456,6 +485,7 @@ where
                 )?;
                 continue;
             }
+            authenticated = true;
             let id = id.ok_or("authenticated CONNECT missing installation")?;
             let host = host.ok_or("authenticated CONNECT missing hostname")?;
             let generation = generation.ok_or("authenticated CONNECT missing generation")?;
@@ -939,6 +969,62 @@ mod tests {
         let (mut server, _) = listener.accept().await.unwrap();
         assert!(read_sni(&mut server).await.is_err());
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_control_connection_closes_at_its_deadline() {
+        let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+            return;
+        };
+        let gateway = Arc::new(Gateway {
+            store: Store::connect(&url).await.unwrap(),
+            gateway_id: "fixture".into(),
+            tunnels: Mutex::new(HashMap::new()),
+            tickets: Mutex::new(HashMap::new()),
+            streams: Arc::new(Semaphore::new(1)),
+            lifecycles: Arc::new(Semaphore::new(1)),
+        });
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let connection = server::handshake(server_io).await.unwrap();
+            let (shutdown, _) = watch::channel(false);
+            let mut lifecycles = JoinSet::new();
+            serve_control_connection(
+                gateway,
+                connection,
+                shutdown,
+                &mut lifecycles,
+                Duration::from_millis(500),
+            )
+            .await
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let started = Instant::now();
+        // Refused requests do not extend the deadline.
+        while !server.is_finished() && started.elapsed() < Duration::from_secs(5) {
+            let Ok(mut ready) = client.ready().await else {
+                break;
+            };
+            let request = http::Request::builder()
+                .method(Method::POST)
+                .uri("https://relay-control.bloom.directory/v1/tunnel")
+                .body(())
+                .unwrap();
+            if let Ok((response, _)) = ready.send_request(request, true)
+                && let Ok(response) = response.await
+            {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            client = ready;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let closed = timeout(Duration::from_secs(1), server)
+            .await
+            .expect("unauthenticated connection outlived its deadline");
+        assert!(closed.unwrap().is_ok());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        driver.abort();
     }
 
     #[tokio::test]

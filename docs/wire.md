@@ -12,10 +12,15 @@ never leaves Broker.
 Allocation begins with a 60-second bootstrap nonce. Signer signs
 `bloom-relay/control/v1\0 || JCS(AuthClaims)`, where JCS is RFC 8785 JSON
 canonicalization. Claims contain version, installation ID (nil during
-bootstrap), scope, generation, audience, operation ID, nonce, absolute
-millisecond expiry, and SHA-256 of the JCS body. Signatures are unpadded
-base64url Ed25519. The control service verifies scope, audience, body digest,
-signature, deadline, and one-time nonce before mutation.
+bootstrap), scope, action, generation, audience, operation ID, nonce, absolute
+millisecond expiry, and SHA-256 of the JCS body. The action names the one
+operation the signature authorizes (`enroll`, `issue_credential`,
+`register_acme_account`, `installation_status` or `retire_installation`);
+each endpoint accepts only its own, so a signature for one operation is never
+accepted by another even when their bodies are identical. Signatures are
+unpadded base64url Ed25519. The control service verifies scope, action,
+audience, body digest, signature, deadline, and one-time nonce before
+mutation.
 
 An allocation response is `AllocationReceipt`: allocation, operation ID,
 admin-public-key SHA-256, issued time, and relay signature. The signature
