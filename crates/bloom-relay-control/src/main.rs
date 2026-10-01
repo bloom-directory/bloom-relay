@@ -14,10 +14,10 @@ use bloom_relay_protocol::{
     sha256_hex,
 };
 use bloom_relay_store::{DnsJobScope, RestoreWitness, Store};
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
 use std::{
-    env, fs,
+    env,
     net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -25,10 +25,11 @@ use std::{
 use uuid::Uuid;
 mod client_addr;
 mod dns_worker;
+mod receipt_signer;
 
 struct AppState {
     store: Store,
-    receipt_key: SigningKey,
+    receipt_signer: receipt_signer::ReceiptSigner,
     audience: String,
     placement: String,
 }
@@ -144,10 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err("invalid control audience".into());
     }
     let placement = env::var("BLOOM_RELAY_PLACEMENT")?;
-    let key_bytes = fs::read(env::var("BLOOM_RELAY_RECEIPT_KEY_PATH")?)?;
-    let key_bytes: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| "receipt key must be 32 raw bytes")?;
+    let receipt_signer = receipt_signer::ReceiptSigner::from_env().await?;
     let witness_path = env::var("BLOOM_RELAY_RESTORE_WITNESS_PATH")?;
     let acme_environment = configured_acme_environment()?;
     let state = Arc::new(AppState {
@@ -157,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await?
         .with_acme_environment(acme_environment),
-        receipt_key: SigningKey::from_bytes(&key_bytes),
+        receipt_signer,
         audience,
         placement,
     });
@@ -668,12 +666,12 @@ async fn enroll(
         issued_at_ms: now_ms(),
         signature: String::new(),
     };
-    receipt.signature = URL_SAFE_NO_PAD.encode(
-        state
-            .receipt_key
-            .sign(&receipt.signed_bytes().map_err(|_| unavailable())?)
-            .to_bytes(),
-    );
+    let signed = receipt.signed_bytes().map_err(|_| unavailable())?;
+    let signature = state.receipt_signer.sign(&signed).await.map_err(|error| {
+        tracing::error!(%error, "receipt signing failed");
+        unavailable()
+    })?;
+    receipt.signature = URL_SAFE_NO_PAD.encode(signature);
     Ok(Json(receipt))
 }
 
@@ -751,6 +749,7 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
+    use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
 
     #[test]
@@ -833,7 +832,7 @@ mod tests {
         let id = allocation.installation_id;
         let state = Arc::new(AppState {
             store: store.clone(),
-            receipt_key: key.clone(),
+            receipt_signer: receipt_signer::ReceiptSigner::Local(key.clone()),
             audience: "relay-control.bloom.directory".into(),
             placement: "fixture".into(),
         });

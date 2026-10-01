@@ -28,9 +28,13 @@ serde_jcs.workspace = true
 rustls.workspace = true
 aws-config.workspace = true
 aws-sdk-route53.workspace = true
+aws-sdk-kms.workspace = true
 tower-layer = "0.3.3"
 
 [dev-dependencies]
+aws-sdk-kms = { workspace = true, features = ["test-util"] }
+aws-smithy-mocks = "0"
+aws-smithy-types = "1"
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14.7"
 tokio-rustls.workspace = true
