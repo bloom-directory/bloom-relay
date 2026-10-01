@@ -37,6 +37,15 @@ const CONTROL_ORIGIN: &str = "https://relay-control.bloom.directory";
 /// The caller persists `new_token` and `operation_id` before this call and
 /// atomically replaces its protected credential file after the receipt. On an
 /// ambiguous transport failure it retries those same values.
+/// `ureq` returns HTTP error statuses as errors; keep them apart from
+/// connection failures so a refusal never reads as an outage.
+fn control_error(error: ureq::Error) -> ClientError {
+    match error {
+        ureq::Error::StatusCode(status) => ClientError::Refused(status),
+        _ => ClientError::Transport,
+    }
+}
+
 pub async fn renew_scoped_credential(
     control_ca_pem: Vec<u8>,
     installation_id: uuid::Uuid,
@@ -71,7 +80,7 @@ pub async fn renew_scoped_credential(
             .post(format!("{CONTROL_ORIGIN}/v1/credentials/renew"))
             .header("authorization", format!("Bearer {current}"))
             .send_json(request)
-            .map_err(|_| ClientError::Transport)?;
+            .map_err(control_error)?;
         let receipt: CredentialIssueReceipt = response
             .body_mut()
             .with_config()
@@ -280,6 +289,10 @@ pub enum ClientError {
     TunnelRetired,
     #[error("relay rejected tunnel")]
     Rejected,
+    /// The control API answered with an HTTP error status (for example 401
+    /// for an expired credential): a refusal, not an outage.
+    #[error("relay control refused the request (HTTP {0})")]
+    Refused(u16),
 }
 
 pub struct TunnelClient {
@@ -501,7 +514,7 @@ pub async fn probe_public_health(
             .build()
             .new_agent();
         let url = format!("https://{hostname}/.well-known/bloom/relay-health");
-        let response = agent.get(url).call().map_err(|_| ClientError::Transport)?;
+        let response = agent.get(url).call().map_err(control_error)?;
         if response.status() != 204 {
             return Err(ClientError::Rejected);
         }
@@ -651,6 +664,18 @@ fn trusted_response_expiry(expires_at_ms: u64, now_ms: u64, lifetime_ms: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_refusals_are_not_reported_as_transport_failures() {
+        assert!(matches!(
+            control_error(ureq::Error::StatusCode(401)),
+            ClientError::Refused(401)
+        ));
+        assert!(matches!(
+            control_error(ureq::Error::Io(std::io::Error::other("reset"))),
+            ClientError::Transport
+        ));
+    }
 
     #[test]
     fn upstream_is_a_configured_loopback_port_never_a_remote_address() {
