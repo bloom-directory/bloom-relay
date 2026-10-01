@@ -2,7 +2,7 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bloom_relay_protocol::{
-    AcmeAccountRequest, AllocateRequest, Allocation, AllocationReceipt, AuthClaims,
+    AcmeAccountRequest, Action, AllocateRequest, Allocation, AllocationReceipt, AuthClaims,
     BootstrapChallenge, CredentialIssueReceipt, CredentialIssueRequest, InstallationStatusRequest,
     RetireRequest, Scope, SignedRequest, TRUSTED_RESPONSE_CLOCK_SKEW_MS, WIRE_VERSION, sha256_hex,
     validate_hostname,
@@ -112,6 +112,7 @@ where
         version: WIRE_VERSION,
         installation_id: Uuid::nil(),
         scope: Scope::SurfaceAdmin,
+        action: Action::Enroll,
         generation: 0,
         audience: CONTROL_AUDIENCE.into(),
         operation_id,
@@ -175,6 +176,7 @@ where
         version: WIRE_VERSION,
         installation_id,
         scope: Scope::SurfaceAdmin,
+        action: Action::IssueCredential,
         generation: 0,
         audience: CONTROL_AUDIENCE.into(),
         operation_id,
@@ -230,6 +232,7 @@ where
         version: WIRE_VERSION,
         installation_id,
         scope: Scope::SurfaceAdmin,
+        action: Action::RegisterAcmeAccount,
         generation: 0,
         audience: CONTROL_AUDIENCE.into(),
         operation_id,
@@ -270,6 +273,7 @@ where
         installation_id,
         operation_id,
         InstallationStatusRequest { installation_id },
+        Action::InstallationStatus,
         "/v1/installations/status",
         sign,
     )?;
@@ -297,6 +301,7 @@ where
         installation_id,
         operation_id,
         RetireRequest { installation_id },
+        Action::RetireInstallation,
         "/v1/installations/retire",
         sign,
     )?;
@@ -311,6 +316,7 @@ fn signed_admin_call<T, F>(
     installation_id: Uuid,
     operation_id: Uuid,
     body: T,
+    action: Action,
     path: &str,
     sign: F,
 ) -> Result<ureq::http::Response<ureq::Body>, EnrollmentError>
@@ -325,6 +331,7 @@ where
         version: WIRE_VERSION,
         installation_id,
         scope: Scope::SurfaceAdmin,
+        action,
         generation: 0,
         audience: CONTROL_AUDIENCE.into(),
         operation_id,

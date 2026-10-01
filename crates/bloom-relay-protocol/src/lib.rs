@@ -89,12 +89,27 @@ pub enum Scope {
     DnsChallenge,
 }
 
+/// The control operation a signature authorizes. Bodies of different
+/// operations can be identical (status and retirement both name only the
+/// installation), so each handler requires its own action: a signature for
+/// one operation is never accepted by another.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Enroll,
+    IssueCredential,
+    RegisterAcmeAccount,
+    InstallationStatus,
+    RetireInstallation,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthClaims {
     pub version: u16,
     pub installation_id: Uuid,
     pub scope: Scope,
+    pub action: Action,
     pub generation: u64,
     pub audience: String,
     pub operation_id: Uuid,
@@ -127,11 +142,14 @@ impl AuthClaims {
         body: &[u8],
         signature: &str,
         key: &VerifyingKey,
-        required_scope: Scope,
+        (required_scope, required_action): (Scope, Action),
         audience: &str,
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
-        if self.scope != required_scope || self.audience != audience {
+        if self.scope != required_scope
+            || self.action != required_action
+            || self.audience != audience
+        {
             return Err(ProtocolError::Unauthorized);
         }
         if self.expires_at_ms <= now_ms || self.expires_at_ms > now_ms.saturating_add(60_000) {
@@ -516,13 +534,14 @@ mod tests {
     }
 
     #[test]
-    fn signed_claims_reject_wrong_scope_body_and_deadline() {
+    fn signed_claims_reject_wrong_scope_action_body_and_deadline() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let body = b"{}";
         let claims = AuthClaims {
             version: WIRE_VERSION,
             installation_id: Uuid::nil(),
             scope: Scope::DnsChallenge,
+            action: Action::InstallationStatus,
             generation: 2,
             audience: "relay-control.bloom.directory".into(),
             operation_id: Uuid::nil(),
@@ -537,7 +556,7 @@ mod tests {
                     body,
                     &sig,
                     &key.verifying_key(),
-                    Scope::DnsChallenge,
+                    (Scope::DnsChallenge, Action::InstallationStatus),
                     "relay-control.bloom.directory",
                     1_000
                 )
@@ -548,7 +567,18 @@ mod tests {
                 body,
                 &sig,
                 &key.verifying_key(),
-                Scope::SurfaceAdmin,
+                (Scope::SurfaceAdmin, Action::InstallationStatus),
+                "relay-control.bloom.directory",
+                1_000
+            ),
+            Err(ProtocolError::Unauthorized)
+        );
+        assert_eq!(
+            claims.verify(
+                body,
+                &sig,
+                &key.verifying_key(),
+                (Scope::DnsChallenge, Action::RetireInstallation),
                 "relay-control.bloom.directory",
                 1_000
             ),
@@ -559,7 +589,7 @@ mod tests {
                 b"bad",
                 &sig,
                 &key.verifying_key(),
-                Scope::DnsChallenge,
+                (Scope::DnsChallenge, Action::InstallationStatus),
                 "relay-control.bloom.directory",
                 1_000
             ),
@@ -570,7 +600,7 @@ mod tests {
                 body,
                 &sig,
                 &key.verifying_key(),
-                Scope::DnsChallenge,
+                (Scope::DnsChallenge, Action::InstallationStatus),
                 "relay-control.bloom.directory",
                 5_000
             ),
