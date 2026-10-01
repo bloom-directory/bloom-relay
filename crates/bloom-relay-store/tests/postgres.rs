@@ -765,3 +765,138 @@ async fn restore_fence_triggers_advance_at_commit() {
         .map(|name| (name.to_owned(), true, true))
     );
 }
+
+/// A Broker that slept through its renewal window renews on wake: the newest
+/// credential may renew within the grace period after expiry, but an expired
+/// credential never opens a tunnel, and a superseded or long-expired one
+/// never renews.
+#[tokio::test]
+async fn the_newest_credential_renews_within_the_grace_period_after_expiry() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+    let id = store
+        .allocate(Uuid::new_v4(), [21u8; 32], "test-shard")
+        .await
+        .unwrap()
+        .installation_id;
+    store
+        .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+        .await
+        .unwrap();
+    store.mark_dns_ready(id).await.unwrap();
+    let token = |byte: char| byte.to_string().repeat(43);
+    let hash = |token: &str| -> [u8; 32] { Sha256::digest(token.as_bytes()).into() };
+    let expire = |generation: u64, ago: &'static str| {
+        let pool = store.pool().clone();
+        async move {
+            sqlx::query(
+                "UPDATE scoped_bearer_credentials SET expires_at=now()-$3::text::interval \
+                 WHERE installation_id=$1 AND scope='tunnel' AND generation=$2",
+            )
+            .bind(id)
+            .bind(generation as i64)
+            .bind(ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // Asleep through the window: expired an hour ago, still the newest.
+    let (generation, _) = store
+        .issue_bearer(id, Uuid::new_v4(), "tunnel", hash(&token('a')), 3600)
+        .await
+        .unwrap();
+    expire(generation, "1 hour").await;
+    assert_eq!(
+        store
+            .authenticate_bearer(id, "tunnel", &token('a'))
+            .await
+            .unwrap(),
+        None,
+        "an expired credential never opens a tunnel"
+    );
+    let (renewed, _) = store
+        .renew_bearer(
+            id,
+            Uuid::new_v4(),
+            "tunnel",
+            generation,
+            &token('a'),
+            hash(&token('b')),
+        )
+        .await
+        .unwrap();
+    assert!(renewed > generation);
+    assert_eq!(
+        store
+            .authenticate_bearer(id, "tunnel", &token('b'))
+            .await
+            .unwrap(),
+        Some(renewed)
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_audit WHERE installation_id=$1 AND event='credential_renewed_after_expiry'",
+    )
+    .bind(id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+    // The renewal revoked the old credential: it cannot renew twice.
+    assert!(matches!(
+        store
+            .renew_bearer(
+                id,
+                Uuid::new_v4(),
+                "tunnel",
+                generation,
+                &token('a'),
+                hash(&token('c'))
+            )
+            .await,
+        Err(StoreError::Unauthorized)
+    ));
+
+    // Past the grace period nothing renews.
+    expire(renewed, "8 days").await;
+    assert!(matches!(
+        store
+            .renew_bearer(
+                id,
+                Uuid::new_v4(),
+                "tunnel",
+                renewed,
+                &token('b'),
+                hash(&token('d'))
+            )
+            .await,
+        Err(StoreError::Unauthorized)
+    ));
+
+    // A newer credential supersedes an older unrevoked one, even in grace.
+    let (older, _) = store
+        .issue_bearer(id, Uuid::new_v4(), "tunnel", hash(&token('e')), 3600)
+        .await
+        .unwrap();
+    let (_newer, _) = store
+        .issue_bearer(id, Uuid::new_v4(), "tunnel", hash(&token('f')), 3600)
+        .await
+        .unwrap();
+    expire(older, "1 hour").await;
+    assert!(matches!(
+        store
+            .renew_bearer(
+                id,
+                Uuid::new_v4(),
+                "tunnel",
+                older,
+                &token('e'),
+                hash(&token('g'))
+            )
+            .await,
+        Err(StoreError::Unauthorized)
+    ));
+}
