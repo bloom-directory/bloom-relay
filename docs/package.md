@@ -123,7 +123,9 @@ gateway receive neither token.
 
 Each service has separate loopback HTTP health (`/health/live`,
 `/health/ready`) and Prometheus listeners. Public control routes expose
-neither. Scrape through a restricted local collector. Metrics contain only
+neither. HAProxy health-checks the API and gateway on their loopback readiness
+ports and answers `GET /healthz` on the control address with 200 while both
+are ready and 503 otherwise, for external monitors; it exposes nothing else. Scrape through a restricted local collector. Metrics contain only
 bounded service labels and aggregate counters/gauges for ingress admission,
 live tunnel/stream counts, byte volume, DNS jobs, CT feed lag, and certificate
 expiry. Configure alert thresholds and dashboards for each deployment.

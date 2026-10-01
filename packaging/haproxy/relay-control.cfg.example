@@ -14,16 +14,30 @@ defaults
 
 frontend relay_control
   bind CONTROL_IP:443 ssl crt /etc/bloom-relay/control-haproxy.pem alpn h2,http/1.1
+  # Public readiness for external monitors: 200 while HAProxy sees both the
+  # API and the gateway ready, 503 otherwise. No other detail is exposed.
+  monitor-uri /healthz
+  acl api_down nbsrv(relay_api) lt 1
+  acl gateway_down nbsrv(relay_tunnel) lt 1
+  monitor fail if api_down || gateway_down
   acl tunnel_open path -i /v1/tunnel
   acl tunnel_attach method CONNECT
   use_backend relay_tunnel if tunnel_open
   use_backend relay_tunnel if tunnel_attach
   default_backend relay_api
-  # PROXY v2 hands the API each client's address for its bootstrap quotas;
-  # the API sets BLOOM_RELAY_CONTROL_PROXY_PROTOCOL=v2 to require it.
 
+# Health checks go to each service's loopback readiness port as plain HTTP,
+# without TLS or a PROXY header (an explicit check port disables both).
 backend relay_tunnel
-  server gateway 127.0.0.1:18444 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2
+  option httpchk
+  http-check send meth GET uri /health/ready
+  http-check expect status 200
+  server gateway 127.0.0.1:18444 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2 check port 19201 inter 5s fall 2 rise 2
 
+# PROXY v2 hands the API each client's address for its bootstrap quotas;
+# the API sets BLOOM_RELAY_CONTROL_PROXY_PROTOCOL=v2 to require it.
 backend relay_api
-  server api 127.0.0.1:18443 send-proxy-v2 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2
+  option httpchk
+  http-check send meth GET uri /health/ready
+  http-check expect status 200
+  server api 127.0.0.1:18443 send-proxy-v2 ssl verify required ca-file /etc/ssl/certs/ca-certificates.crt verifyhost relay-control.bloom.directory sni str(relay-control.bloom.directory) alpn h2 check port 19202 inter 5s fall 2 rise 2
