@@ -126,13 +126,12 @@ Each service has separate loopback HTTP health (`/health/live`,
 neither. Scrape through a restricted local collector. Metrics contain only
 bounded service labels and aggregate counters/gauges for ingress admission,
 live tunnel/stream counts, byte volume, DNS jobs, CT feed lag, and certificate
-expiry. Configure alert thresholds and dashboards before production.
+expiry. Configure alert thresholds and dashboards for each deployment.
 
 Start the API, both DNS workers, CT monitor, gateway and control router only
 after schema/witness validation and protected credentials are in place.
 Readiness is an initial process check; live external HTTPS, public DNS,
-certificate validity, and CT alert delivery still need independent rollout
-checks. On SIGTERM, the gateway stops admission and drains existing connections
+certificate validity, and CT alert delivery need independent checks. On SIGTERM, the gateway stops admission and drains existing connections
 for up to 30 seconds, API asks axum-server for a 30-second graceful stop,
 and workers stop between jobs/ticks. The DNS outbox is replay-safe after an
 interrupted job. To roll back a binary, stop services, keep the witness and
