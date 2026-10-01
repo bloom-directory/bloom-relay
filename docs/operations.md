@@ -14,9 +14,14 @@ For Route 53, restrict DNS roles to the delegated zone and exact record types.
 The `relay-control.bloom.directory` TLS identity and receipt-signing
 key need separate protected provisioning and rotation procedures.
 
-The API process takes its PostgreSQL URL, bind address, placement, TLS
-certificate/key paths and raw 32-byte receipt-signing key path from
-restricted service configuration. The gateway takes PostgreSQL URL,
+The API process takes its PostgreSQL URL, bind address, placement and TLS
+certificate/key paths from restricted service configuration. It signs
+allocation receipts either with a raw 32-byte Ed25519 seed
+(`BLOOM_RELAY_RECEIPT_KEY_PATH`) or with an AWS KMS `ECC_NIST_EDWARDS25519` key
+(`BLOOM_RELAY_RECEIPT_KMS_KEY_ARN`, instance-role credentials only), whose
+private half never leaves KMS. Set `BLOOM_RELAY_RECEIPT_PUBLIC_KEY_HEX` to the
+public key Signers pin so a wrong key refuses to start; every signature is also
+verified locally before it is returned. The gateway takes PostgreSQL URL,
 gateway ID, control bind, public ingress bind and control TLS key paths.
 The gateway ID must exactly equal its shard placement. A tunnel claim at a
 different placement is rejected even with a valid scoped credential. Each DNS
