@@ -272,7 +272,7 @@ async fn acme_registration_is_restricted_to_configured_environment() {
 }
 
 #[tokio::test]
-async fn abandoned_pending_and_challenge_leases_are_swept_without_reuse() {
+async fn abandoned_pending_allocations_and_challenge_values_are_swept_without_reuse() {
     let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
         return;
     };

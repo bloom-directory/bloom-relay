@@ -4,6 +4,10 @@
 -- validates. `revision` changes whenever the set's membership changes; the
 -- challenge worker records `ready_revision` only after it has published and
 -- observed exactly that revision.
+-- Block lease writes from the previous release for the rest of this
+-- (transactional) migration first, so the scan below sees every lease: an
+-- in-flight insert either commits before it or fails once the table is gone.
+LOCK TABLE challenge_leases IN ACCESS EXCLUSIVE MODE;
 -- Queue one reconciliation for every installation that has ever had a lease,
 -- before dropping them. With no values in the new set, the worker removes any
 -- TXT records the old leases left published (provider writes are idempotent).

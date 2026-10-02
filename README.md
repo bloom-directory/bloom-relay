@@ -186,8 +186,10 @@ Proposed `/v1` control API operations: bootstrap challenge/enrollment, installat
 status, scoped credential renewal, ACME account registration/rebinding, DNS-01
 challenge ensure/readiness, certificate metadata publication, tunnel claim and
 retirement.
-Every mutation has typed input, authorization scope, nonce/expiry, generation,
-idempotency key, bounded size and stable operation status. Never accept arbitrary
+Every mutation has typed input, an authorization scope and a bounded size.
+Signed administrative mutations also carry nonce/expiry, generation, an
+idempotency key and a stable operation status; a DNS-01 challenge ensure is
+bearer-authenticated and idempotent by its value. Never accept arbitrary
 DNS names or record types from the client. Publish a wire schema and compatibility
 vectors in `bloom-relay-protocol` before Broker integration.
 
