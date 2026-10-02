@@ -33,7 +33,7 @@ pub enum DnsError {
     InvalidChange,
     #[error("DNS provider unavailable")]
     Unavailable,
-    #[error("DNS lease conflicts with current owner")]
+    #[error("existing DNS records conflict with the requested change")]
     Conflict,
 }
 
