@@ -564,10 +564,8 @@ impl Store {
         // The installation row serializes every change to its challenge set.
         sqlx::query("SELECT installation_id FROM installations WHERE installation_id=$1 AND state='dns_ready' FOR UPDATE")
             .bind(installation_id).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
-        // The authenticating credential must still be current when the set
-        // changes. FOR SHARE makes a concurrent revocation wait for this
-        // transaction, or this one see it revoked. It is taken after the
-        // installation row, the order renewal and issuance also use.
+        // The authenticating credential must still be current; FOR SHARE
+        // serializes with revocation (installation row first, as elsewhere).
         sqlx::query("SELECT 1 FROM scoped_bearer_credentials WHERE installation_id=$1 AND scope='dns_challenge' AND generation=$2 AND revoked_at IS NULL AND expires_at>now() FOR SHARE")
             .bind(installation_id).bind(generation as i64).fetch_optional(&mut *tx).await?
             .ok_or(StoreError::Unauthorized)?;
@@ -578,8 +576,8 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         let lifetime = CHALLENGE_VALUE_LIFETIME_MS as f64 / 1000.0;
-        let refreshed = sqlx::query("UPDATE challenge_values SET expires_at=now()+make_interval(secs=>$3), generation=$4 WHERE installation_id=$1 AND txt_value=$2 AND expires_at>now() RETURNING (extract(epoch FROM expires_at)*1000)::bigint AS expiry")
-            .bind(installation_id).bind(txt_value).bind(lifetime).bind(generation as i64)
+        let refreshed = sqlx::query("UPDATE challenge_values SET expires_at=now()+make_interval(secs=>$3) WHERE installation_id=$1 AND txt_value=$2 AND expires_at>now() RETURNING (extract(epoch FROM expires_at)*1000)::bigint AS expiry")
+            .bind(installation_id).bind(txt_value).bind(lifetime)
             .fetch_optional(&mut *tx).await?;
         let expiry: i64 = if let Some(row) = refreshed {
             row.get("expiry")
@@ -595,8 +593,8 @@ impl Store {
             .bind(installation_id)
             .execute(&mut *tx)
             .await?;
-            let expiry: i64 = sqlx::query_scalar("INSERT INTO challenge_values(installation_id,txt_value,generation,expires_at) VALUES ($1,$2,$3,now()+make_interval(secs=>$4)) RETURNING (extract(epoch FROM expires_at)*1000)::bigint")
-                .bind(installation_id).bind(txt_value).bind(generation as i64).bind(lifetime)
+            let expiry: i64 = sqlx::query_scalar("INSERT INTO challenge_values(installation_id,txt_value,expires_at) VALUES ($1,$2,now()+make_interval(secs=>$3)) RETURNING (extract(epoch FROM expires_at)*1000)::bigint")
+                .bind(installation_id).bind(txt_value).bind(lifetime)
                 .fetch_one(&mut *tx).await?;
             Self::challenge_set_changed(&mut tx, installation_id, "challenge_value_added").await?;
             expiry
@@ -650,12 +648,10 @@ impl Store {
             .fetch_optional(&self.pool).await?.is_some())
     }
 
-    /// The set the challenge worker should publish: the revision and the stored
-    /// membership, read in one snapshot. Values past their expiry stay in the
-    /// set until an ensure or the sweep removes them, because only those
-    /// advance the revision; filtering by time here could publish a set
-    /// without a value refreshed concurrently and still mark that revision
-    /// ready. Readiness separately requires the value to be unexpired.
+    /// The set the challenge worker should publish: the revision and stored
+    /// membership, in one snapshot. Lapsed values stay until an ensure or the
+    /// sweep removes them (both advance the revision), so a concurrent refresh
+    /// can never be dropped from a revision that is then marked ready.
     pub async fn challenge_target(
         &self,
         installation_id: Uuid,

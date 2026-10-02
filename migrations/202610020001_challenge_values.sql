@@ -4,19 +4,11 @@
 -- validates. `revision` changes whenever the set's membership changes; the
 -- challenge worker records `ready_revision` only after it has published and
 -- observed exactly that revision.
--- Block lease writes from the previous release for the rest of this
--- (transactional) migration first, so the scan below sees every lease: an
--- in-flight insert either commits before it or fails once the table is gone.
+-- Lock first so the scan sees every lease. Then queue one reconciliation per
+-- installation that had a lease: with an empty set it removes their old TXT
+-- records. A previous-release job cannot write after it: all DNS jobs hold the
+-- installation's advisory lock and old jobs read challenge_leases under it.
 LOCK TABLE challenge_leases IN ACCESS EXCLUSIVE MODE;
--- Queue one reconciliation for every installation that has ever had a lease,
--- before dropping them. With no values in the new set, the worker removes any
--- TXT records the old leases left published (provider writes are idempotent).
--- The outstanding per-lease jobs are superseded by that reconciliation. A
--- previous-release worker that already claimed one cannot publish after it:
--- every DNS job, old and new, runs under the installation's advisory lock and
--- the old job reads challenge_leases under that lock before writing, so it
--- either finishes its write before the reconciliation takes the lock or finds
--- the table gone and writes nothing.
 INSERT INTO outbox(installation_id, kind, payload)
   SELECT DISTINCT installation_id, 'reconcile_txt', '{}'::jsonb FROM challenge_leases;
 UPDATE outbox SET completed_at = now()
@@ -26,7 +18,6 @@ DROP TABLE challenge_leases;
 CREATE TABLE challenge_values (
   installation_id UUID NOT NULL REFERENCES installations(installation_id),
   txt_value TEXT NOT NULL CHECK (txt_value ~ '^[A-Za-z0-9_-]{43}$'),
-  generation BIGINT NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (installation_id, txt_value)
