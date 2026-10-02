@@ -555,6 +555,12 @@ impl Store {
         // The installation row serializes every change to its challenge set.
         sqlx::query("SELECT installation_id FROM installations WHERE installation_id=$1 AND state='dns_ready' FOR UPDATE")
             .bind(installation_id).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
+        // The authenticating credential must still be current when the set
+        // changes. FOR SHARE makes a concurrent revocation wait for this
+        // transaction, or this one see it revoked.
+        sqlx::query("SELECT 1 FROM scoped_bearer_credentials WHERE installation_id=$1 AND scope='dns_challenge' AND generation=$2 AND revoked_at IS NULL AND expires_at>now() FOR SHARE")
+            .bind(installation_id).bind(generation as i64).fetch_optional(&mut *tx).await?
+            .ok_or(StoreError::Unauthorized)?;
         sqlx::query(
             "INSERT INTO challenge_state(installation_id) VALUES ($1) ON CONFLICT DO NOTHING",
         )
@@ -628,8 +634,9 @@ impl Store {
         txt_value: &str,
         revision: u64,
     ) -> Result<bool, StoreError> {
+        let revision = i64::try_from(revision).map_err(|_| StoreError::InvalidRequest)?;
         Ok(sqlx::query("SELECT 1 FROM challenge_state s JOIN challenge_values v USING (installation_id) WHERE s.installation_id=$1 AND v.txt_value=$2 AND v.expires_at>now() AND s.ready_revision=s.revision AND s.ready_revision>=$3")
-            .bind(installation_id).bind(txt_value).bind(revision as i64)
+            .bind(installation_id).bind(txt_value).bind(revision)
             .fetch_optional(&self.pool).await?.is_some())
     }
 

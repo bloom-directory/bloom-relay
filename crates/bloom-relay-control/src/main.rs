@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tracing::warn!(%error, "pending allocation sweep failed");
             }
             if let Err(error) = sweeper_store.expire_challenge_values(100).await {
-                tracing::warn!(%error, "challenge lease sweep failed");
+                tracing::warn!(%error, "challenge value sweep failed");
             }
             if let Err(error) = sweeper_store.prune_bootstrap_and_nonces(1_000).await {
                 tracing::warn!(%error, "bootstrap and nonce prune failed");
@@ -393,6 +393,8 @@ async fn ensure_dns_challenge(
         .await
         .map_err(|error| match error {
             bloom_relay_store::StoreError::InvalidRequest => invalid(),
+            // The credential was revoked or expired after authentication.
+            bloom_relay_store::StoreError::Unauthorized => unauthorized(),
             // Not dns_ready, or two other values are live: retry after one lapses.
             bloom_relay_store::StoreError::Conflict => {
                 ApiError(StatusCode::CONFLICT, ErrorCode::Conflict, true)
@@ -416,7 +418,10 @@ async fn dns_challenge_ready(
         .store
         .challenge_value_ready(installation_id, &value, revision)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|error| match error {
+            bloom_relay_store::StoreError::InvalidRequest => invalid(),
+            _ => unavailable(),
+        })?;
     Ok(if ready {
         StatusCode::NO_CONTENT
     } else {
@@ -815,6 +820,11 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::CONFLICT);
         assert_eq!(
             call(ensure(&token, "not-a-value")).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // A revision beyond PostgreSQL's BIGINT is refused, never wrapped.
+        assert_eq!(
+            call(ready(&a, u64::MAX)).await.status(),
             StatusCode::BAD_REQUEST
         );
     }

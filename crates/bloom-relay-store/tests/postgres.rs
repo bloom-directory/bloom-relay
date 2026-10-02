@@ -377,23 +377,44 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
         .await
         .unwrap();
     store.mark_dns_ready(id).await.unwrap();
+    // Only a current DNS-challenge credential may change the set.
+    assert!(matches!(
+        store.ensure_challenge_value(id, 1, &a).await,
+        Err(StoreError::Unauthorized)
+    ));
+    let (generation, _) = store
+        .issue_bearer(
+            id,
+            Uuid::new_v4(),
+            "dns_challenge",
+            Sha256::digest(b"challenge-set-token").into(),
+            3600,
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         store
-            .ensure_challenge_value(id, 1, "not-a-dns-01-value")
+            .ensure_challenge_value(id, generation, "not-a-dns-01-value")
             .await,
         Err(StoreError::InvalidRequest)
     ));
 
     // Adding a value advances the revision; refreshing it does not, so a
     // client refreshing while it waits never resets readiness.
-    let first = store.ensure_challenge_value(id, 1, &a).await.unwrap();
+    let first = store
+        .ensure_challenge_value(id, generation, &a)
+        .await
+        .unwrap();
     assert!(
         store
             .mark_challenge_reconciled(id, first.revision)
             .await
             .unwrap()
     );
-    let refreshed = store.ensure_challenge_value(id, 1, &a).await.unwrap();
+    let refreshed = store
+        .ensure_challenge_value(id, generation, &a)
+        .await
+        .unwrap();
     assert_eq!(refreshed.revision, first.revision);
     assert!(refreshed.expires_at_ms >= first.expires_at_ms);
     assert!(
@@ -404,7 +425,10 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
     );
 
     // An interrupted attempt's value and its replacement coexist.
-    let second = store.ensure_challenge_value(id, 1, &b).await.unwrap();
+    let second = store
+        .ensure_challenge_value(id, generation, &b)
+        .await
+        .unwrap();
     assert_eq!(second.revision, first.revision + 1);
     assert_eq!(
         store.challenge_target(id).await.unwrap(),
@@ -447,12 +471,12 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
     // A third distinct value is refused while two are live; refreshing one of
     // them still works at capacity.
     assert!(matches!(
-        store.ensure_challenge_value(id, 1, &c).await,
+        store.ensure_challenge_value(id, generation, &c).await,
         Err(StoreError::Conflict)
     ));
     assert_eq!(
         store
-            .ensure_challenge_value(id, 1, &b)
+            .ensure_challenge_value(id, generation, &b)
             .await
             .unwrap()
             .revision,
@@ -470,7 +494,10 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
             .await
             .unwrap()
     );
-    let third = store.ensure_challenge_value(id, 1, &c).await.unwrap();
+    let third = store
+        .ensure_challenge_value(id, generation, &c)
+        .await
+        .unwrap();
     assert_eq!(
         store.challenge_target(id).await.unwrap(),
         (third.revision, vec![b.clone(), c.clone()])
@@ -478,7 +505,10 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
     // Re-ensuring a lapsed value republishes it as a new member.
     sqlx::query("UPDATE challenge_values SET expires_at=now()-interval '1 second' WHERE installation_id=$1 AND txt_value=$2")
         .bind(id).bind(&b).execute(store.pool()).await.unwrap();
-    let revived = store.ensure_challenge_value(id, 1, &b).await.unwrap();
+    let revived = store
+        .ensure_challenge_value(id, generation, &b)
+        .await
+        .unwrap();
     assert!(revived.revision > third.revision);
 
     let jobs: i64 = sqlx::query_scalar(
@@ -492,6 +522,19 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
         jobs, 4,
         "every membership change queues its own reconciliation"
     );
+
+    // An out-of-range revision is refused rather than wrapped to a negative
+    // BIGINT, and a revoked credential can no longer change the set.
+    assert!(matches!(
+        store.challenge_value_ready(id, &c, u64::MAX).await,
+        Err(StoreError::InvalidRequest)
+    ));
+    sqlx::query("UPDATE scoped_bearer_credentials SET revoked_at=now() WHERE installation_id=$1 AND scope='dns_challenge'")
+        .bind(id).execute(store.pool()).await.unwrap();
+    assert!(matches!(
+        store.ensure_challenge_value(id, generation, &c).await,
+        Err(StoreError::Unauthorized)
+    ));
 }
 
 #[tokio::test]
