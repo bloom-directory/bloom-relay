@@ -137,7 +137,7 @@ Allocation and DNS are a reconciled workflow:
    transactionally with an idempotency key and durable outbox entry.
 2. Register the Broker-created ACME account URI, publish exact CAA and A/AAAA
    records, then observe authoritative DNS before declaring DNS ready.
-3. Broker requests DNS-01 leases, obtains its own exact-host certificate, opens
+3. Broker ensures DNS-01 challenge values, obtains its own exact-host certificate, opens
    its tunnel, and proves external HTTPS readiness before ceremony activation.
 4. Retry incomplete stages under the same installation/operation ID; no second
    hostname is allocated because a provider response was lost.
@@ -183,8 +183,9 @@ old hostname: provision a new installation identity and use the wallet's existin
 credential/recovery protocol to regain access.
 
 Proposed `/v1` control API operations: bootstrap challenge/enrollment, installation
-status, scoped credential renewal, ACME account registration/rebinding, challenge
-lease create/delete, certificate metadata publication, tunnel claim and retirement.
+status, scoped credential renewal, ACME account registration/rebinding, DNS-01
+challenge ensure/readiness, certificate metadata publication, tunnel claim and
+retirement.
 Every mutation has typed input, authorization scope, nonce/expiry, generation,
 idempotency key, bounded size and stable operation status. Never accept arbitrary
 DNS names or record types from the client. Publish a wire schema and compatibility
@@ -192,12 +193,13 @@ vectors in `bloom-relay-protocol` before Broker integration.
 
 ## DNS-01, CAA and certificate lifecycle
 
-Challenge API inputs are installation ID, lease/operation ID and TXT value;
-server derives `_acme-challenge.<assigned-hostname>`. Use short expiring leases,
-conditional updates and per-host serialization. Cleanup removes only its own
-value; delayed cleanup cannot remove a newer concurrent challenge. Authenticate
-scope on both creation and deletion and audit lifecycle events without TXT values.
-Check propagation before reporting ready. Sweep abandoned leases idempotently.
+Challenge API inputs are installation ID and TXT value; the server derives
+`_acme-challenge.<assigned-hostname>`. Each installation has a bounded set of
+short-lived desired values that clients ensure and refresh; there are no
+client-chosen lease identities or deletes, so a stale cleanup cannot remove a
+newer challenge. Mutations serialize per installation, workers publish the
+current set and record readiness only for the revision they observed, and
+lifecycle events are audited without TXT values. See [wire](docs/wire.md).
 
 The DNS worker alone holds a provider identity restricted to the selected zone;
 further enforce exact ownership and record-type boundaries in code. Route 53
@@ -259,7 +261,7 @@ through Broker ceremony IDs; relay never replays a partially forwarded stream.
 
 PostgreSQL is authoritative for installations/admin keys, scoped credential
 generations, hostname/tombstone ownership, ingress placement and leases, ACME
-bindings, DNS jobs/challenge leases, certificate inventory, audit and idempotency
+bindings, DNS jobs/challenge values, certificate inventory, audit and idempotency
 records. Use transactions, uniqueness constraints and compare-and-swap revisions;
 external DNS changes use a transactional outbox with reconciliation, not a pretend
 cross-system transaction. Audit security mutations in the same DB transaction.

@@ -1,8 +1,8 @@
 //! Route 53 provider. The caller supplies a zone-restricted AWS client identity.
 
 use super::{
-    DnsError, NameRecords, Provider, TTL_SECONDS, TxtLease, caa_values, challenge_name,
-    validate_records,
+    DnsError, NameRecords, Provider, TTL_SECONDS, caa_values, challenge_name,
+    validate_challenge_values, validate_records,
 };
 use aws_sdk_route53::types::{
     Change, ChangeAction, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType,
@@ -149,56 +149,20 @@ impl Provider for Route53Provider {
         self.apply(changes).await
     }
 
-    async fn create_txt(&self, lease: TxtLease) -> Result<(), DnsError> {
-        let name = challenge_name(&lease.hostname)?;
-        if lease.value.is_empty() || lease.value.len() > 255 {
-            return Err(DnsError::InvalidChange);
+    async fn set_challenge(&self, hostname: &str, values: &[String]) -> Result<(), DnsError> {
+        let name = challenge_name(hostname)?;
+        validate_challenge_values(values)?;
+        if values.is_empty() {
+            return self.retire_challenge(hostname).await;
         }
+        // One record set holds every value; an UPSERT replaces it whole.
         self.apply(vec![change(
             &name,
             RrType::Txt,
             30,
-            [format!("\"{}\"", lease.value)],
+            values.iter().map(|value| format!("\"{value}\"")),
             ChangeAction::Upsert,
         )?])
-        .await
-    }
-
-    async fn delete_txt(&self, lease: &TxtLease) -> Result<(), DnsError> {
-        let name = challenge_name(&lease.hostname)?;
-        let current = self
-            .client
-            .list_resource_record_sets()
-            .hosted_zone_id(&self.hosted_zone_id)
-            .start_record_name(&name)
-            .max_items(2)
-            .send()
-            .await
-            .map_err(|_| DnsError::Unavailable)?;
-        let Some(record) = current.resource_record_sets().iter().find(|record| {
-            record.name().trim_end_matches('.') == name && record.r#type() == &RrType::Txt
-        }) else {
-            return Ok(());
-        };
-        let quoted = format!("\"{}\"", lease.value);
-        if !record
-            .resource_records()
-            .iter()
-            .any(|value| value.value() == quoted)
-        {
-            // A newer lease's UPSERT already replaced this value.
-            return Ok(());
-        }
-        if record.resource_records().len() != 1 {
-            return Err(DnsError::Conflict);
-        }
-        self.apply(vec![
-            Change::builder()
-                .action(ChangeAction::Delete)
-                .resource_record_set(record.clone())
-                .build()
-                .map_err(|_| DnsError::InvalidChange)?,
-        ])
         .await
     }
 
@@ -321,46 +285,66 @@ mod tests {
             .unwrap()
     }
 
-    fn lease(value: &str) -> TxtLease {
-        TxtLease {
-            hostname: HOST.into(),
-            lease_id: "old".into(),
-            value: value.into(),
-            expires_at_ms: 1,
-        }
+    fn changed() -> ChangeResourceRecordSetsOutput {
+        ChangeResourceRecordSetsOutput::builder()
+            .change_info(
+                ChangeInfo::builder()
+                    .id("C1")
+                    .status(ChangeStatus::Pending)
+                    .submitted_at(aws_sdk_route53::primitives::DateTime::from_secs(0))
+                    .build()
+                    .unwrap(),
+            )
+            .build()
     }
 
     #[tokio::test]
-    async fn cleanup_deletes_its_own_value_and_leaves_a_newer_lease() {
-        let newer = mock!(Client::list_resource_record_sets).then_output(|| published("new"));
-        let provider = mocked(&[&newer]);
-        // Only the list rule exists: any change request would fail the call.
-        provider.delete_txt(&lease("old")).await.unwrap();
-
-        let own = mock!(Client::list_resource_record_sets).then_output(|| published("old"));
-        let delete = mock!(Client::change_resource_record_sets)
+    async fn challenge_set_is_one_upserted_record_set_and_empty_deletes_it() {
+        let (a, b) = ("a".repeat(43), "b".repeat(43));
+        let upsert = mock!(Client::change_resource_record_sets)
             .match_requests(|request| {
                 request.change_batch().is_some_and(|batch| {
+                    let change = &batch.changes()[0];
                     batch.changes().len() == 1
-                        && batch.changes()[0].action() == &ChangeAction::Delete
+                        && change.action() == &ChangeAction::Upsert
+                        && change.resource_record_set().is_some_and(|set| {
+                            set.resource_records()
+                                .iter()
+                                .map(|record| record.value())
+                                .eq([
+                                    format!("\"{}\"", "a".repeat(43)),
+                                    format!("\"{}\"", "b".repeat(43)),
+                                ]
+                                .iter()
+                                .map(String::as_str))
+                        })
                 })
             })
-            .then_output(|| {
-                ChangeResourceRecordSetsOutput::builder()
-                    .change_info(
-                        ChangeInfo::builder()
-                            .id("C1")
-                            .status(ChangeStatus::Pending)
-                            .submitted_at(aws_sdk_route53::primitives::DateTime::from_secs(0))
-                            .build()
-                            .unwrap(),
-                    )
-                    .build()
-            });
-        let provider = mocked(&[&own, &delete]);
-        provider.delete_txt(&lease("old")).await.unwrap();
+            .then_output(changed);
+        let provider = mocked(&[&upsert]);
+        provider
+            .set_challenge(HOST, &[a.clone(), b.clone()])
+            .await
+            .unwrap();
+        assert_eq!(upsert.num_calls(), 1);
+
+        let published = mock!(Client::list_resource_record_sets)
+            .then_output(|| published("a".repeat(43).as_str()));
+        let delete = mock!(Client::change_resource_record_sets)
+            .match_requests(|request| {
+                request
+                    .change_batch()
+                    .is_some_and(|batch| batch.changes()[0].action() == &ChangeAction::Delete)
+            })
+            .then_output(changed);
+        let provider = mocked(&[&published, &delete]);
+        provider.set_challenge(HOST, &[]).await.unwrap();
         assert_eq!(delete.num_calls(), 1);
+
+        let provider = mocked(&[]);
+        assert!(provider.set_challenge(HOST, &[a.clone(), a]).await.is_err());
     }
+
     #[test]
     fn provider_changes_are_exact_and_bounded() {
         assert!(

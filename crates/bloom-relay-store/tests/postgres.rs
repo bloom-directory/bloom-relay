@@ -1,4 +1,4 @@
-use bloom_relay_protocol::{AcmeEnvironment, CertificateMetadata, ChallengeLease};
+use bloom_relay_protocol::{AcmeEnvironment, CertificateMetadata};
 use bloom_relay_store::{DnsJobScope, RestoreWitness, Store, StoreError, WitnessError};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -138,27 +138,38 @@ async fn allocation_rotation_dns_and_fencing() {
         .issue_bearer(id, Uuid::new_v4(), "dns_challenge", dns_hash, 86_400)
         .await
         .unwrap();
-    let lease_id = Uuid::new_v4();
-    let lease = ChallengeLease {
-        operation_id: lease_id,
-        txt_value: "a".repeat(43),
-        expires_at_ms: now_ms() + 600_000,
-    };
-    store
-        .create_challenge(id, dns_generation, &lease)
+    let value = "a".repeat(43);
+    let ensured = store
+        .ensure_challenge_value(id, dns_generation, &value)
         .await
         .unwrap();
-    assert!(!store.challenge_ready(id, lease_id).await.unwrap());
-    store.mark_challenge_ready(id, lease_id).await.unwrap();
-    assert!(store.challenge_ready(id, lease_id).await.unwrap());
-    store
-        .delete_challenge(id, dns_generation, lease_id)
-        .await
-        .unwrap();
-    assert!(!store.challenge_ready(id, lease_id).await.unwrap());
+    assert!(
+        !store
+            .challenge_value_ready(id, &value, ensured.revision)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_challenge_reconciled(id, ensured.revision)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .challenge_value_ready(id, &value, ensured.revision)
+            .await
+            .unwrap()
+    );
     let retire_operation = Uuid::new_v4();
     store.retire(id, retire_operation).await.unwrap();
     store.retire(id, retire_operation).await.unwrap();
+    assert!(
+        !store
+            .challenge_value_ready(id, &value, ensured.revision)
+            .await
+            .unwrap()
+    );
     assert!(matches!(
         store.retire(id, issue).await,
         Err(StoreError::Conflict)
@@ -310,137 +321,177 @@ async fn abandoned_pending_and_challenge_leases_are_swept_without_reuse() {
         .issue_bearer(id, Uuid::new_v4(), "dns_challenge", token_hash, 3600)
         .await
         .unwrap();
-    let lease_id = Uuid::new_v4();
-    store
-        .create_challenge(
-            id,
-            generation,
-            &ChallengeLease {
-                operation_id: lease_id,
-                txt_value: "z".repeat(43),
-                expires_at_ms: now_ms() + 60_000,
-            },
-        )
+    let value = "z".repeat(43);
+    let ensured = store
+        .ensure_challenge_value(id, generation, &value)
         .await
         .unwrap();
-    sqlx::query("UPDATE challenge_leases SET expires_at=now()-interval '1 second' WHERE installation_id=$1 AND lease_id=$2")
-        .bind(id).bind(lease_id).execute(store.pool()).await.unwrap();
-    assert!(store.expire_challenge_leases(100).await.unwrap() >= 1);
-    assert!(!store.challenge_ready(id, lease_id).await.unwrap());
+    sqlx::query(
+        "UPDATE challenge_values SET expires_at=now()-interval '1 second' WHERE installation_id=$1",
+    )
+    .bind(id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(store.expire_challenge_values(100).await.unwrap() >= 1);
+    assert!(
+        !store
+            .challenge_value_ready(id, &value, ensured.revision)
+            .await
+            .unwrap()
+    );
+    let (revision, values) = store.challenge_target(id).await.unwrap();
+    assert!(values.is_empty());
+    assert_eq!(revision, ensured.revision + 1);
     let jobs: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM outbox WHERE installation_id=$1 AND kind='remove_txt'",
+        "SELECT count(*) FROM outbox WHERE installation_id=$1 AND kind='reconcile_txt'",
     )
     .bind(id)
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(jobs, 1);
+    assert_eq!(jobs, 2, "one reconciliation per membership change");
 }
 
 #[tokio::test]
-async fn challenge_jobs_decode_active_expired_and_deleted_leases() {
+async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readiness() {
     let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
         return;
     };
     let store = Store::connect(&url).await.unwrap();
     let allocation = store
-        .allocate(Uuid::new_v4(), [5u8; 32], "challenge-job-test")
+        .allocate(Uuid::new_v4(), [5u8; 32], "challenge-set-test")
         .await
         .unwrap();
     let id = allocation.installation_id;
+    let a = "a".repeat(43);
+    let b = "b".repeat(43);
+    let c = "c".repeat(43);
+    // Only a dns_ready installation may publish challenges.
+    assert!(matches!(
+        store.ensure_challenge_value(id, 1, &a).await,
+        Err(StoreError::Conflict)
+    ));
     store
         .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
         .await
         .unwrap();
     store.mark_dns_ready(id).await.unwrap();
-    let token_hash: [u8; 32] = Sha256::digest(b"challenge-job-token").into();
-    let (generation, _) = store
-        .issue_bearer(id, Uuid::new_v4(), "dns_challenge", token_hash, 3600)
-        .await
-        .unwrap();
+    assert!(matches!(
+        store
+            .ensure_challenge_value(id, 1, "not-a-dns-01-value")
+            .await,
+        Err(StoreError::InvalidRequest)
+    ));
 
-    let expired_id = Uuid::new_v4();
-    let expiry = now_ms() + 600_000;
-    store
-        .create_challenge(
-            id,
-            generation,
-            &ChallengeLease {
-                operation_id: expired_id,
-                txt_value: "e".repeat(43),
-                expires_at_ms: expiry,
-            },
-        )
-        .await
-        .unwrap();
-    let active = store
-        .challenge_for_job(id, expired_id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(active.operation_id, expired_id);
-    assert_eq!(active.txt_value, "e".repeat(43));
-    assert!(active.expires_at_ms.abs_diff(expiry) <= 1);
-
-    sqlx::query("UPDATE challenge_leases SET expires_at=now()-interval '1 second' WHERE installation_id=$1 AND lease_id=$2")
-        .bind(id).bind(expired_id).execute(store.pool()).await.unwrap();
+    // Adding a value advances the revision; refreshing it does not, so a
+    // client refreshing while it waits never resets readiness.
+    let first = store.ensure_challenge_value(id, 1, &a).await.unwrap();
     assert!(
         store
-            .challenge_for_job(id, expired_id, false)
+            .mark_challenge_reconciled(id, first.revision)
             .await
             .unwrap()
-            .is_none()
     );
-    let expired_cleanup = store
-        .challenge_for_job(id, expired_id, true)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(expired_cleanup.operation_id, expired_id);
-    assert_eq!(expired_cleanup.txt_value, "e".repeat(43));
+    let refreshed = store.ensure_challenge_value(id, 1, &a).await.unwrap();
+    assert_eq!(refreshed.revision, first.revision);
+    assert!(refreshed.expires_at_ms >= first.expires_at_ms);
+    assert!(
+        store
+            .challenge_value_ready(id, &a, first.revision)
+            .await
+            .unwrap()
+    );
 
-    let deleted_id = Uuid::new_v4();
-    store
-        .create_challenge(
-            id,
-            generation,
-            &ChallengeLease {
-                operation_id: deleted_id,
-                txt_value: "d".repeat(43),
-                expires_at_ms: now_ms() + 600_000,
-            },
-        )
-        .await
-        .unwrap();
-    // A newer active lease must not suppress cleanup of the old lease's own
-    // record (providers delete by lease, never the newer value).
+    // An interrupted attempt's value and its replacement coexist.
+    let second = store.ensure_challenge_value(id, 1, &b).await.unwrap();
+    assert_eq!(second.revision, first.revision + 1);
+    assert_eq!(
+        store.challenge_target(id).await.unwrap(),
+        (second.revision, vec![a.clone(), b.clone()])
+    );
+    // The set changed, so neither value is ready until the new revision is
+    // observed; a worker that finished the old revision cannot claim it.
+    assert!(
+        !store
+            .challenge_value_ready(id, &a, first.revision)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .mark_challenge_reconciled(id, first.revision)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_challenge_reconciled(id, second.revision)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .challenge_value_ready(id, &b, second.revision)
+            .await
+            .unwrap()
+    );
+    // A value the client never ensured is not ready, whatever the revision.
+    assert!(
+        !store
+            .challenge_value_ready(id, &c, second.revision)
+            .await
+            .unwrap()
+    );
+
+    // A third distinct value is refused while two are live; refreshing one of
+    // them still works at capacity.
+    assert!(matches!(
+        store.ensure_challenge_value(id, 1, &c).await,
+        Err(StoreError::Conflict)
+    ));
     assert_eq!(
         store
-            .challenge_for_job(id, expired_id, true)
+            .ensure_challenge_value(id, 1, &b)
             .await
             .unwrap()
-            .unwrap()
-            .txt_value,
-        "e".repeat(43)
+            .revision,
+        second.revision
     );
-    store
-        .delete_challenge(id, generation, deleted_id)
-        .await
-        .unwrap();
+
+    // Once a value lapses it stops counting, before any sweep: the third value
+    // joins, the lapsed one leaves the published set, and a lapsed value is
+    // never reported ready.
+    sqlx::query("UPDATE challenge_values SET expires_at=now()-interval '1 second' WHERE installation_id=$1 AND txt_value=$2")
+        .bind(id).bind(&a).execute(store.pool()).await.unwrap();
     assert!(
-        store
-            .challenge_for_job(id, deleted_id, false)
+        !store
+            .challenge_value_ready(id, &a, second.revision)
             .await
             .unwrap()
-            .is_none()
     );
-    let deleted_cleanup = store
-        .challenge_for_job(id, deleted_id, true)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(deleted_cleanup.operation_id, deleted_id);
-    assert_eq!(deleted_cleanup.txt_value, "d".repeat(43));
+    let third = store.ensure_challenge_value(id, 1, &c).await.unwrap();
+    assert_eq!(
+        store.challenge_target(id).await.unwrap(),
+        (third.revision, vec![b.clone(), c.clone()])
+    );
+    // Re-ensuring a lapsed value republishes it as a new member.
+    sqlx::query("UPDATE challenge_values SET expires_at=now()-interval '1 second' WHERE installation_id=$1 AND txt_value=$2")
+        .bind(id).bind(&b).execute(store.pool()).await.unwrap();
+    let revived = store.ensure_challenge_value(id, 1, &b).await.unwrap();
+    assert!(revived.revision > third.revision);
+
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE installation_id=$1 AND kind='reconcile_txt'",
+    )
+    .bind(id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        jobs, 4,
+        "every membership change queues its own reconciliation"
+    );
 }
 
 #[tokio::test]

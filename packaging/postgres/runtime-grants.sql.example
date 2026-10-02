@@ -26,7 +26,7 @@ GRANT SELECT ON installations, ct_feed_checkpoints TO "bloom-relay-gateway",
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO "bloom-relay-api";
 GRANT INSERT, UPDATE, DELETE ON installations, hostname_reservations, operations,
   used_nonces, bootstrap_challenges, scoped_credentials,
-  scoped_bearer_credentials, tunnel_leases, challenge_leases,
+  scoped_bearer_credentials, tunnel_leases, challenge_values, challenge_state,
   certificate_inventory, outbox TO "bloom-relay-api";
 GRANT USAGE ON SEQUENCE outbox_id_seq TO "bloom-relay-api";
 
@@ -41,8 +41,8 @@ GRANT SELECT ON outbox TO "bloom-relay-dns-serving", "bloom-relay-dns-challenge"
 GRANT UPDATE (attempts, next_attempt_at, completed_at) ON outbox
   TO "bloom-relay-dns-serving", "bloom-relay-dns-challenge";
 GRANT UPDATE (state) ON installations TO "bloom-relay-dns-serving";
-GRANT SELECT ON challenge_leases TO "bloom-relay-dns-challenge";
-GRANT UPDATE (dns_ready_at) ON challenge_leases TO "bloom-relay-dns-challenge";
+GRANT SELECT ON challenge_values, challenge_state TO "bloom-relay-dns-challenge";
+GRANT UPDATE (ready_revision) ON challenge_state TO "bloom-relay-dns-challenge";
 
 GRANT SELECT ON certificate_inventory, ct_observations, ct_alerts,
   ct_health_alerts TO "bloom-relay-ct";

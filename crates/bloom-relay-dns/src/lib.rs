@@ -1,6 +1,9 @@
 //! Exact-owner DNS changes; provider credentials remain in the control worker.
 
-use bloom_relay_protocol::{ProtocolError, validate_acme_account_uri, validate_hostname};
+use bloom_relay_protocol::{
+    MAX_LIVE_CHALLENGE_VALUES, ProtocolError, validate_acme_account_uri, validate_challenge_value,
+    validate_hostname,
+};
 use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -22,14 +25,6 @@ pub struct NameRecords {
     pub acme_account_uri: String,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct TxtLease {
-    pub hostname: String,
-    pub lease_id: String,
-    pub value: String,
-    pub expires_at_ms: u64,
-}
-
 #[derive(Debug, Error)]
 pub enum DnsError {
     #[error("invalid assigned hostname")]
@@ -47,13 +42,12 @@ pub trait Provider: Send + Sync {
         &self,
         records: NameRecords,
     ) -> impl std::future::Future<Output = Result<(), DnsError>> + Send;
-    fn create_txt(
+    /// Make the hostname's `_acme-challenge` TXT records exactly `values`
+    /// (no records when empty). Idempotent; replays converge.
+    fn set_challenge(
         &self,
-        lease: TxtLease,
-    ) -> impl std::future::Future<Output = Result<(), DnsError>> + Send;
-    fn delete_txt(
-        &self,
-        lease: &TxtLease,
+        hostname: &str,
+        values: &[String],
     ) -> impl std::future::Future<Output = Result<(), DnsError>> + Send;
     fn retire_name(
         &self,
@@ -89,6 +83,20 @@ pub fn caa_values(acme_account_uri: &str) -> Result<[String; 2], DnsError> {
     ])
 }
 
+/// A challenge set the relay may publish: distinct DNS-01 values, bounded.
+pub fn validate_challenge_values(values: &[String]) -> Result<(), DnsError> {
+    let distinct: std::collections::BTreeSet<_> = values.iter().collect();
+    if values.len() > MAX_LIVE_CHALLENGE_VALUES
+        || distinct.len() != values.len()
+        || values
+            .iter()
+            .any(|value| validate_challenge_value(value).is_err())
+    {
+        return Err(DnsError::InvalidChange);
+    }
+    Ok(())
+}
+
 pub fn challenge_name(hostname: &str) -> Result<String, DnsError> {
     validate_hostname(hostname)?;
     Ok(format!("_acme-challenge.{hostname}"))
@@ -103,15 +111,21 @@ pub struct MemoryProvider {
 #[derive(Default)]
 struct MemoryState {
     names: BTreeMap<String, NameRecords>,
-    leases: BTreeMap<String, TxtLease>,
+    challenges: BTreeMap<String, Vec<String>>,
 }
 
 impl MemoryProvider {
     pub async fn records(&self, hostname: &str) -> Option<NameRecords> {
         self.inner.lock().await.names.get(hostname).cloned()
     }
-    pub async fn txt(&self, hostname: &str) -> Option<TxtLease> {
-        self.inner.lock().await.leases.get(hostname).cloned()
+    pub async fn challenge(&self, hostname: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .await
+            .challenges
+            .get(hostname)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -126,33 +140,16 @@ impl Provider for MemoryProvider {
         Ok(())
     }
 
-    async fn create_txt(&self, lease: TxtLease) -> Result<(), DnsError> {
-        challenge_name(&lease.hostname)?;
-        if lease.value.is_empty() || lease.value.len() > 255 || lease.lease_id.is_empty() {
-            return Err(DnsError::InvalidChange);
-        }
+    async fn set_challenge(&self, hostname: &str, values: &[String]) -> Result<(), DnsError> {
+        challenge_name(hostname)?;
+        validate_challenge_values(values)?;
         let mut state = self.inner.lock().await;
-        match state.leases.get(&lease.hostname) {
-            Some(current)
-                if current.lease_id != lease.lease_id
-                    && current.expires_at_ms >= lease.expires_at_ms =>
-            {
-                Err(DnsError::Conflict)
-            }
-            _ => {
-                state.leases.insert(lease.hostname.clone(), lease);
-                Ok(())
-            }
-        }
-    }
-
-    async fn delete_txt(&self, lease: &TxtLease) -> Result<(), DnsError> {
-        challenge_name(&lease.hostname)?;
-        let mut state = self.inner.lock().await;
-        if state.leases.get(&lease.hostname).is_some_and(|current| {
-            current.lease_id == lease.lease_id && current.value == lease.value
-        }) {
-            state.leases.remove(&lease.hostname);
+        if values.is_empty() {
+            state.challenges.remove(hostname);
+        } else {
+            state
+                .challenges
+                .insert(hostname.to_owned(), values.to_vec());
         }
         Ok(())
     }
@@ -166,7 +163,7 @@ impl Provider for MemoryProvider {
 
     async fn retire_challenge(&self, hostname: &str) -> Result<(), DnsError> {
         challenge_name(hostname)?;
-        self.inner.lock().await.leases.remove(hostname);
+        self.inner.lock().await.challenges.remove(hostname);
         Ok(())
     }
 }
@@ -175,26 +172,27 @@ impl Provider for MemoryProvider {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn delayed_cleanup_cannot_delete_new_lease() {
+    async fn challenge_set_is_replaced_exactly_and_validated() {
         let dns = MemoryProvider::default();
         let host = "abcdefghijklmnopqrstuv2345.relay.bloom.directory";
-        let old = TxtLease {
-            hostname: host.into(),
-            lease_id: "old".into(),
-            value: "a".into(),
-            expires_at_ms: 1,
-        };
-        dns.create_txt(old.clone()).await.unwrap();
-        dns.create_txt(TxtLease {
-            hostname: host.into(),
-            lease_id: "new".into(),
-            value: "b".into(),
-            expires_at_ms: 2,
-        })
-        .await
-        .unwrap();
-        dns.delete_txt(&old).await.unwrap();
-        assert_eq!(dns.txt(host).await.unwrap().value, "b");
+        let (a, b) = ("a".repeat(43), "b".repeat(43));
+        dns.set_challenge(host, &[a.clone(), b.clone()])
+            .await
+            .unwrap();
+        assert_eq!(dns.challenge(host).await, vec![a.clone(), b.clone()]);
+        dns.set_challenge(host, std::slice::from_ref(&b))
+            .await
+            .unwrap();
+        assert_eq!(dns.challenge(host).await, vec![b.clone()]);
+        dns.set_challenge(host, &[]).await.unwrap();
+        assert!(dns.challenge(host).await.is_empty());
+        for invalid in [
+            vec![a.clone(), a.clone()],
+            vec![a.clone(), b.clone(), "c".repeat(43)],
+            vec!["short".into()],
+        ] {
+            assert!(dns.set_challenge(host, &invalid).await.is_err());
+        }
         assert!(challenge_name("sibling.example").is_err());
     }
 
@@ -209,19 +207,12 @@ mod tests {
         })
         .await
         .unwrap();
-        dns.create_txt(TxtLease {
-            hostname: host.into(),
-            lease_id: "lease".into(),
-            value: "value".into(),
-            expires_at_ms: 5,
-        })
-        .await
-        .unwrap();
+        dns.set_challenge(host, &["v".repeat(43)]).await.unwrap();
         dns.retire_name(host).await.unwrap();
         assert!(dns.records(host).await.is_none());
-        assert!(dns.txt(host).await.is_some());
+        assert!(!dns.challenge(host).await.is_empty());
         dns.retire_challenge(host).await.unwrap();
-        assert!(dns.txt(host).await.is_none());
+        assert!(dns.challenge(host).await.is_empty());
     }
 
     #[test]

@@ -36,7 +36,8 @@ to its installation admin, including retired tombstones. Signed
 `POST /v1/installations/retire` permanently fences tunnel authority, enqueues
 exact DNS cleanup and retains the hostname reservation; repeating the same
 operation ID is safe. Pending allocations that never reach DNS readiness
-retire after 24 hours. Expired DNS-01 leases are deleted by a bounded sweep.
+retire after 24 hours. Lapsed DNS-01 challenge values are removed by a bounded
+sweep.
 
 The routine tunnel uses outbound TLS with HTTP/2 and a separately scoped
 random bearer credential in an owner-only file. A successful
@@ -98,9 +99,29 @@ peer threshold. Admission occurs before stream buffers are allocated.
 
 The DNS adapter accepts only an assigned exact hostname in the delegated
 `relay.bloom.directory` zone. It publishes explicit A/AAAA and exact CAA
-records, with 300-second address TTL. A TXT lease derives the
-`_acme-challenge.` name on the server. The control plane never accepts an
+records, with 300-second address TTL. The control plane never accepts an
 arbitrary DNS owner/type from Broker.
+
+DNS-01 challenges are a desired set of TXT values per installation, published
+at `_acme-challenge.<assigned-hostname>` (derived on the server). There are no
+client lease identities and no delete:
+
+- `POST /v1/dns/challenge` (`DnsChallengeEnsureRequest`: version, installation
+  ID, 43-character base64url value; DNS-challenge bearer) ensures the value:
+  it joins the set, or, if already live, its five-minute lifetime restarts.
+  The reply (`DnsChallengeState`) gives the set's `revision` and the value's
+  expiry. At most two values are live; a third distinct value is refused with
+  409 until one lapses. Ensure again before expiry to keep a value published
+  while ACME validates; abandoned values simply lapse.
+- `GET /v1/dns/challenge/{installation}/ready/{revision}/{value}` returns 204
+  when the value is live and the published set at that revision or later has
+  been observed on DNS, otherwise 202.
+
+The revision changes only when membership changes (a value added, revived or
+lapsed), never on refresh. Each change queues one reconciliation; the challenge
+worker publishes the current set exactly, observes every value, and records
+readiness only if the revision is still current. Retirement clears the set.
+A restarted client repeats the same ensure and resumes.
 The public control API holds no AWS identity. Separate serving and challenge
 workers claim disjoint outbox job types and receive distinct Route 53 roles;
 retirement queues serving-record and TXT cleanup independently.

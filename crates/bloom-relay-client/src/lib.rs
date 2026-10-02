@@ -1,10 +1,9 @@
 //! Broker-owned tunnel client. It can only attach to the fixed ceremony listener.
 
 use bloom_relay_protocol::{
-    CertificateMetadata, ChallengeLease, ControlDecoder, CredentialIssueReceipt,
-    CredentialRenewRequest, DnsChallengeDeleteRequest, DnsChallengeRequest,
-    MAX_INSTALLATION_STREAMS, Scope, TRUSTED_RESPONSE_CLOCK_SKEW_MS, TunnelEvent, WIRE_VERSION,
-    sha256_hex, validate_hostname,
+    CertificateMetadata, ControlDecoder, CredentialIssueReceipt, CredentialRenewRequest,
+    DnsChallengeEnsureRequest, DnsChallengeState, MAX_INSTALLATION_STREAMS, Scope,
+    TRUSTED_RESPONSE_CLOCK_SKEW_MS, TunnelEvent, WIRE_VERSION, sha256_hex, validate_hostname,
 };
 use bytes::Bytes;
 use futures_util::future::poll_fn;
@@ -37,15 +36,6 @@ const CONTROL_ORIGIN: &str = "https://relay-control.bloom.directory";
 /// The caller persists `new_token` and `operation_id` before this call and
 /// atomically replaces its protected credential file after the receipt. On an
 /// ambiguous transport failure it retries those same values.
-/// The status of an authenticated DNS-challenge or certificate call. An HTTP
-/// error status is the relay refusing (for example 409 while another DNS-01
-/// lease is active), not an outage.
-fn response_status(
-    response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
-) -> Result<u16, ClientError> {
-    Ok(response.map_err(control_error)?.status().as_u16())
-}
-
 /// `ureq` returns HTTP error statuses as errors; keep them apart from
 /// connection failures so a refusal never reads as an outage.
 fn control_error(error: ureq::Error) -> ClientError {
@@ -161,7 +151,6 @@ fn validate_token(token: &str) -> Result<(), ClientError> {
 #[derive(Clone)]
 pub struct DnsChallengeClient {
     installation_id: uuid::Uuid,
-    generation: u64,
     credential_path: PathBuf,
     control_ca_pem: Vec<u8>,
 }
@@ -170,66 +159,62 @@ impl DnsChallengeClient {
     pub fn new(
         control_ca_pem: Vec<u8>,
         installation_id: uuid::Uuid,
-        generation: u64,
         credential_path: PathBuf,
     ) -> Result<Self, ClientError> {
         if control_ca_pem.is_empty()
             || installation_id.is_nil()
-            || generation == 0
             || credential_path.as_os_str().is_empty()
         {
             return Err(ClientError::InvalidConfiguration);
         }
         Ok(Self {
             installation_id,
-            generation,
             credential_path,
             control_ca_pem,
         })
     }
 
-    pub async fn create(&self, lease: ChallengeLease) -> Result<(), ClientError> {
-        let request = DnsChallengeRequest {
+    /// Publish `txt_value` (or keep it published) for this installation's
+    /// challenge name. Idempotent; call again within the returned expiry to
+    /// keep the value alive while ACME validates. A 409 refusal means two other
+    /// values are live; one lapses within five minutes.
+    pub async fn ensure(&self, txt_value: &str) -> Result<DnsChallengeState, ClientError> {
+        let request = DnsChallengeEnsureRequest {
             version: WIRE_VERSION,
             installation_id: self.installation_id,
-            generation: self.generation,
-            nonce: uuid::Uuid::new_v4().to_string(),
-            lease,
+            txt_value: txt_value.to_owned(),
         };
-        self.call(
-            "POST",
-            "/v1/dns/challenge".to_owned(),
-            Some(serde_json::to_value(request).map_err(|_| ClientError::InvalidConfiguration)?),
-            202,
-        )
-        .await
+        let (status, body) = self
+            .request(
+                "POST",
+                "/v1/dns/challenge".to_owned(),
+                Some(serde_json::to_value(request).map_err(|_| ClientError::InvalidConfiguration)?),
+            )
+            .await?;
+        if status != 200 {
+            return Err(ClientError::Rejected);
+        }
+        let state: DnsChallengeState =
+            serde_json::from_slice(&body).map_err(|_| ClientError::Rejected)?;
+        if state.version != WIRE_VERSION {
+            return Err(ClientError::Rejected);
+        }
+        Ok(state)
     }
 
-    pub async fn ready(&self, lease_id: uuid::Uuid) -> Result<bool, ClientError> {
-        let path = format!("/v1/dns/challenge/{}/{}", self.installation_id, lease_id);
-        let status = self.request("GET", path, None).await?;
-        match status {
+    /// Whether `txt_value` is published and observed at `revision` or later.
+    pub async fn ready(&self, txt_value: &str, revision: u64) -> Result<bool, ClientError> {
+        bloom_relay_protocol::validate_challenge_value(txt_value)
+            .map_err(|_| ClientError::InvalidConfiguration)?;
+        let path = format!(
+            "/v1/dns/challenge/{}/ready/{revision}/{txt_value}",
+            self.installation_id
+        );
+        match self.request("GET", path, None).await?.0 {
             204 => Ok(true),
             202 => Ok(false),
             _ => Err(ClientError::Rejected),
         }
-    }
-
-    pub async fn delete(&self, lease_id: uuid::Uuid) -> Result<(), ClientError> {
-        let request = DnsChallengeDeleteRequest {
-            version: WIRE_VERSION,
-            installation_id: self.installation_id,
-            generation: self.generation,
-            nonce: uuid::Uuid::new_v4().to_string(),
-            lease_id,
-        };
-        self.call(
-            "POST",
-            "/v1/dns/challenge/delete".to_owned(),
-            Some(serde_json::to_value(request).map_err(|_| ClientError::InvalidConfiguration)?),
-            202,
-        )
-        .await
     }
 
     pub async fn report_certificate(
@@ -252,7 +237,7 @@ impl DnsChallengeClient {
         body: Option<serde_json::Value>,
         expected: u16,
     ) -> Result<(), ClientError> {
-        if self.request(method, path, body).await? == expected {
+        if self.request(method, path, body).await?.0 == expected {
             Ok(())
         } else {
             Err(ClientError::Rejected)
@@ -264,7 +249,7 @@ impl DnsChallengeClient {
         method: &'static str,
         path: String,
         body: Option<serde_json::Value>,
-    ) -> Result<u16, ClientError> {
+    ) -> Result<(u16, Vec<u8>), ClientError> {
         let token = read_credential(&self.credential_path)?;
         let ca = self.control_ca_pem.clone();
         let installation_id = self.installation_id;
@@ -284,7 +269,15 @@ impl DnsChallengeClient {
                     .call(),
                 _ => return Err(ClientError::InvalidConfiguration),
             };
-            response_status(response)
+            let mut response = response.map_err(control_error)?;
+            let status = response.status().as_u16();
+            let body = response
+                .body_mut()
+                .with_config()
+                .limit(16 * 1024)
+                .read_to_vec()
+                .map_err(|_| ClientError::Transport)?;
+            Ok((status, body))
         })
         .await
         .map_err(|_| ClientError::Transport)?
@@ -712,23 +705,6 @@ mod tests {
             control_error(ureq::Error::Io(std::io::Error::other("reset"))),
             ClientError::Transport
         ));
-    }
-
-    #[test]
-    fn dns_challenge_calls_report_refusals_with_their_status() {
-        assert!(matches!(
-            response_status(Err(ureq::Error::StatusCode(409))),
-            Err(ClientError::Refused(409))
-        ));
-        assert!(matches!(
-            response_status(Err(ureq::Error::Io(std::io::Error::other("reset")))),
-            Err(ClientError::Transport)
-        ));
-        let accepted = ureq::http::Response::builder()
-            .status(202)
-            .body(ureq::Body::builder().data(Vec::<u8>::new()))
-            .unwrap();
-        assert_eq!(response_status(Ok(accepted)).unwrap(), 202);
     }
 
     #[test]

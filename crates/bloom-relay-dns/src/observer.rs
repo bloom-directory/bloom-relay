@@ -53,18 +53,27 @@ impl HickoryObserver {
         Ok(check_name(&authoritative, records).await && check_name(&recursive, records).await)
     }
 
-    pub async fn txt_visible(&self, hostname: &str, value: &str) -> Result<bool, DnsError> {
+    /// Every value is published on both resolvers. Extra values do not block
+    /// validation, so presence (not equality) is what readiness needs; the
+    /// provider write already made the set exact.
+    pub async fn challenge_values_visible(
+        &self,
+        hostname: &str,
+        values: &[String],
+    ) -> Result<bool, DnsError> {
+        if values.is_empty() {
+            return self.challenge_absent(hostname).await;
+        }
         let name = challenge_name(hostname)?;
         let (authoritative, recursive) = self.resolvers()?;
-        Ok(check_txt(&authoritative, &name, value).await
-            && check_txt(&recursive, &name, value).await)
-    }
-
-    pub async fn txt_absent(&self, hostname: &str, value: &str) -> Result<bool, DnsError> {
-        let name = challenge_name(hostname)?;
-        let (authoritative, recursive) = self.resolvers()?;
-        Ok(check_txt_absent(&authoritative, &name, value).await
-            && check_txt_absent(&recursive, &name, value).await)
+        for value in values {
+            if !check_txt(&authoritative, &name, value).await
+                || !check_txt(&recursive, &name, value).await
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub async fn name_absent(&self, hostname: &str) -> Result<bool, DnsError> {
@@ -176,21 +185,4 @@ async fn check_txt(resolver: &TokioResolver, name: &str, value: &str) -> bool {
         }
         _ => false,
     })
-}
-
-async fn check_txt_absent(resolver: &TokioResolver, name: &str, value: &str) -> bool {
-    match resolver.lookup(format!("{name}."), RecordType::TXT).await {
-        Ok(lookup) => !lookup.answers().iter().any(|record| match &record.data {
-            RData::TXT(txt) => {
-                txt.txt_data
-                    .iter()
-                    .flat_map(|part| part.iter())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    == value.as_bytes()
-            }
-            _ => false,
-        }),
-        Err(error) => error.is_no_records_found(),
-    }
 }
