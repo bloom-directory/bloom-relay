@@ -650,18 +650,32 @@ impl Store {
             .fetch_optional(&self.pool).await?.is_some())
     }
 
-    /// The set the challenge worker should publish: its revision and live values.
+    /// The set the challenge worker should publish: the revision and the stored
+    /// membership, read in one snapshot. Values past their expiry stay in the
+    /// set until an ensure or the sweep removes them, because only those
+    /// advance the revision; filtering by time here could publish a set
+    /// without a value refreshed concurrently and still mark that revision
+    /// ready. Readiness separately requires the value to be unexpired.
     pub async fn challenge_target(
         &self,
         installation_id: Uuid,
     ) -> Result<(u64, Vec<String>), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let revision: Option<i64> =
             sqlx::query_scalar("SELECT revision FROM challenge_state WHERE installation_id=$1")
                 .bind(installation_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
-        let values: Vec<String> = sqlx::query_scalar("SELECT txt_value FROM challenge_values WHERE installation_id=$1 AND expires_at>now() ORDER BY txt_value")
-            .bind(installation_id).fetch_all(&self.pool).await?;
+        let values: Vec<String> = sqlx::query_scalar(
+            "SELECT txt_value FROM challenge_values WHERE installation_id=$1 ORDER BY txt_value",
+        )
+        .bind(installation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok((revision.unwrap_or(0) as u64, values))
     }
 

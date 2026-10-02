@@ -177,7 +177,8 @@ impl DnsChallengeClient {
     /// Publish `txt_value` (or keep it published) for this installation's
     /// challenge name. Idempotent; call again within the returned expiry to
     /// keep the value alive while ACME validates. A 409 refusal means two other
-    /// values are live; one lapses within five minutes.
+    /// values are live; capacity returns when one expires without being ensured
+    /// again.
     pub async fn ensure(&self, txt_value: &str) -> Result<DnsChallengeState, ClientError> {
         let request = DnsChallengeEnsureRequest {
             version: WIRE_VERSION,

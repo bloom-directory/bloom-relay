@@ -117,11 +117,15 @@ client lease identities and no delete:
   when the value is live and the published set at that revision or later has
   been observed on DNS, otherwise 202.
 
-The revision changes only when membership changes (a value added, revived or
-lapsed), never on refresh. Each change queues one reconciliation; the challenge
-worker publishes the current set exactly, observes every value, and records
-readiness only if the revision is still current. Retirement clears the set.
-A restarted client repeats the same ensure and resumes.
+The revision changes only when membership changes (a value added or revived,
+or a lapsed value removed by an ensure or the sweep), never on refresh. Each
+change queues one reconciliation; the challenge worker reads the stored set
+and its revision in one snapshot, publishes that set exactly, observes every
+value, and records readiness only if the revision is still current. A lapsed
+value stays published until it is removed (within about a minute) but is never
+reported ready. Retirement clears the set. A restarted client repeats the same
+ensure and resumes.
+
 The public control API holds no AWS identity. Separate serving and challenge
 workers claim disjoint outbox job types and receive distinct Route 53 roles;
 retirement queues serving-record and TXT cleanup independently.

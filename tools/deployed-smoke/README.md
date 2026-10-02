@@ -3,7 +3,8 @@
 This is an opt-in, destructive probe for disposable production infrastructure. It
 uses the maintained admin and Broker tunnel clients to enroll a fresh installation,
 verify its signed receipt, issue scoped credentials, register a supplied real ACME
-account URI, exercise a DNS-01 lease, route concurrent pinned synthetic TLS streams
+account URI, ensure a DNS-01 challenge value and wait for its readiness, route
+concurrent pinned synthetic TLS streams
 through the public ingress, reconnect the tunnel, and retire the installation.
 
 It creates no public certificate and proves no browser, passkey, wallet, Signer, or

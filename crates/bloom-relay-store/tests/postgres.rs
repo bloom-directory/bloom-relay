@@ -494,6 +494,12 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
             .await
             .unwrap()
     );
+    // A lapsed value stays in the published set, at the same revision, until
+    // an ensure or the sweep removes it; it is never reported ready.
+    assert_eq!(
+        store.challenge_target(id).await.unwrap(),
+        (second.revision, vec![a.clone(), b.clone()])
+    );
     let third = store
         .ensure_challenge_value(id, generation, &c)
         .await
