@@ -1101,3 +1101,56 @@ async fn consumed_bootstrap_challenges_stay_counted_until_pruned() {
         .unwrap();
     assert_eq!(nonces, 0);
 }
+
+#[tokio::test]
+async fn concurrent_dns_renewal_and_challenge_ensure_never_deadlock() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store = Store::connect(&url).await.unwrap();
+    let id = store
+        .allocate(Uuid::new_v4(), [9u8; 32], "lock-order-test")
+        .await
+        .unwrap()
+        .installation_id;
+    store
+        .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+        .await
+        .unwrap();
+    store.mark_dns_ready(id).await.unwrap();
+    let mut token = "r".repeat(43);
+    let (mut generation, _) = store
+        .issue_bearer(
+            id,
+            Uuid::new_v4(),
+            "dns_challenge",
+            Sha256::digest(token.as_bytes()).into(),
+            3600,
+        )
+        .await
+        .unwrap();
+    // Renewal locks the credential and the installation; ensure locks both
+    // too. Each round races them; a lock-order inversion surfaces as a
+    // PostgreSQL deadlock error (StoreError::Unavailable) from one of them.
+    let value = "v".repeat(43);
+    for round in 0..25u8 {
+        let next = format!("{}{round:02}", "n".repeat(41));
+        let renew = store.renew_bearer(
+            id,
+            Uuid::new_v4(),
+            "dns_challenge",
+            generation,
+            &token,
+            Sha256::digest(next.as_bytes()).into(),
+        );
+        let ensure = store.ensure_challenge_value(id, generation, &value);
+        let (renewed, ensured) = tokio::join!(renew, ensure);
+        let (renewed_generation, _) = renewed.expect("renewal must not deadlock");
+        assert!(
+            matches!(ensured, Ok(_) | Err(StoreError::Unauthorized)),
+            "ensure must succeed or see the revocation, not fail: {ensured:?}"
+        );
+        generation = renewed_generation;
+        token = next;
+    }
+}

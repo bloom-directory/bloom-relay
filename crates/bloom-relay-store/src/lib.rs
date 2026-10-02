@@ -414,6 +414,15 @@ impl Store {
             self.acknowledge().await?;
             return Ok(receipt);
         }
+        // Lock order for credentials: the installation row first, then any
+        // credential row (as issue_bearer and ensure_challenge_value do), so
+        // concurrent renewals, issues and challenge changes cannot deadlock.
+        sqlx::query(
+            "SELECT installation_id FROM installations WHERE installation_id=$1 FOR UPDATE",
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
         // A credential may renew for RENEWAL_GRACE after it expires, so a
         // Broker that slept through its renewal window recovers on wake. Only
         // the newest unrevoked credential for the scope qualifies, so a
@@ -557,7 +566,8 @@ impl Store {
             .bind(installation_id).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
         // The authenticating credential must still be current when the set
         // changes. FOR SHARE makes a concurrent revocation wait for this
-        // transaction, or this one see it revoked.
+        // transaction, or this one see it revoked. It is taken after the
+        // installation row, the order renewal and issuance also use.
         sqlx::query("SELECT 1 FROM scoped_bearer_credentials WHERE installation_id=$1 AND scope='dns_challenge' AND generation=$2 AND revoked_at IS NULL AND expires_at>now() FOR SHARE")
             .bind(installation_id).bind(generation as i64).fetch_optional(&mut *tx).await?
             .ok_or(StoreError::Unauthorized)?;

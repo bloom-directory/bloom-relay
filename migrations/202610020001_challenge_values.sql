@@ -4,9 +4,15 @@
 -- validates. `revision` changes whenever the set's membership changes; the
 -- challenge worker records `ready_revision` only after it has published and
 -- observed exactly that revision.
-DROP TABLE challenge_leases;
+-- Queue one reconciliation for every installation that has ever had a lease,
+-- before dropping them. With no values in the new set, the worker removes any
+-- TXT records the old leases left published (provider writes are idempotent).
+-- The outstanding per-lease jobs are superseded by that reconciliation.
+INSERT INTO outbox(installation_id, kind, payload)
+  SELECT DISTINCT installation_id, 'reconcile_txt', '{}'::jsonb FROM challenge_leases;
 UPDATE outbox SET completed_at = now()
   WHERE kind IN ('publish_txt', 'remove_txt') AND completed_at IS NULL;
+DROP TABLE challenge_leases;
 
 CREATE TABLE challenge_values (
   installation_id UUID NOT NULL REFERENCES installations(installation_id),
