@@ -34,9 +34,6 @@ use tokio_rustls::TlsConnector;
 pub const CEREMONY_UPSTREAM: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18735);
 const CONTROL_ORIGIN: &str = "https://relay-control.bloom.directory";
 
-/// The caller persists `new_token` and `operation_id` before this call and
-/// atomically replaces its protected credential file after the receipt. On an
-/// ambiguous transport failure it retries those same values.
 /// The status of an authenticated DNS-challenge or certificate call. An HTTP
 /// error status is the relay refusing (for example 409 while another DNS-01
 /// lease is active), not an outage.
@@ -55,6 +52,9 @@ fn control_error(error: ureq::Error) -> ClientError {
     }
 }
 
+/// The caller persists `new_token` and `operation_id` before this call and
+/// atomically replaces its protected credential file after the receipt. On an
+/// ambiguous transport failure it retries those same values.
 pub async fn renew_scoped_credential(
     control_ca_pem: Vec<u8>,
     installation_id: uuid::Uuid,
