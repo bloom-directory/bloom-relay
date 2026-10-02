@@ -11,7 +11,12 @@ LOCK TABLE challenge_leases IN ACCESS EXCLUSIVE MODE;
 -- Queue one reconciliation for every installation that has ever had a lease,
 -- before dropping them. With no values in the new set, the worker removes any
 -- TXT records the old leases left published (provider writes are idempotent).
--- The outstanding per-lease jobs are superseded by that reconciliation.
+-- The outstanding per-lease jobs are superseded by that reconciliation. A
+-- previous-release worker that already claimed one cannot publish after it:
+-- every DNS job, old and new, runs under the installation's advisory lock and
+-- the old job reads challenge_leases under that lock before writing, so it
+-- either finishes its write before the reconciliation takes the lock or finds
+-- the table gone and writes nothing.
 INSERT INTO outbox(installation_id, kind, payload)
   SELECT DISTINCT installation_id, 'reconcile_txt', '{}'::jsonb FROM challenge_leases;
 UPDATE outbox SET completed_at = now()
