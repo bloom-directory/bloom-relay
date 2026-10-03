@@ -264,24 +264,19 @@ async fn authenticate_dns(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(unauthorized)?;
-    let Some(observed) = state
+    let observed = match state
         .store
-        .authenticate_bearer(installation_id, "dns_challenge", bearer)
+        .authenticate_bearer_with_state(installation_id, "dns_challenge", bearer)
         .await
         .map_err(|_| unavailable())?
-    else {
+    {
+        Some((generation, installation)) if installation == "dns_ready" => generation,
         // A valid credential whose installation's serving DNS is still being
         // published is early, not unauthorized: tell the client to retry.
-        let early = state
-            .store
-            .bearer_awaiting_dns(installation_id, "dns_challenge", bearer)
-            .await
-            .map_err(|_| unavailable())?;
-        return Err(if early {
-            ApiError(StatusCode::CONFLICT, ErrorCode::Conflict, true)
-        } else {
-            unauthorized()
-        });
+        Some((_, installation)) if installation == "pending_dns" => {
+            return Err(ApiError(StatusCode::CONFLICT, ErrorCode::Conflict, true));
+        }
+        _ => return Err(unauthorized()),
     };
     if generation.is_some_and(|value| value != observed) {
         return Err(unauthorized());

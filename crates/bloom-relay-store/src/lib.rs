@@ -295,20 +295,23 @@ impl Store {
         Ok(row.map(|row| row.get::<i64, _>("generation") as u64))
     }
 
-    /// Whether `bearer` is a current credential of an installation whose
-    /// serving DNS is still pending: the caller is right, just early.
-    pub async fn bearer_awaiting_dns(
+    /// Authenticate a scoped bearer and report its installation's state in
+    /// one snapshot: `Some((generation, state))` for a current credential.
+    /// Lets a caller tell an early request (serving DNS still pending) from an
+    /// unauthorized one without racing the transition to `dns_ready`.
+    pub async fn authenticate_bearer_with_state(
         &self,
         installation_id: Uuid,
         scope: &str,
         bearer: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<(u64, String)>, StoreError> {
         if bearer.len() < 43 || bearer.len() > 128 || !matches!(scope, "tunnel" | "dns_challenge") {
-            return Ok(false);
+            return Ok(None);
         }
         let digest = Sha256::digest(bearer.as_bytes());
-        Ok(sqlx::query("SELECT 1 FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.token_hash=$3 AND c.revoked_at IS NULL AND c.expires_at > now() AND i.state='pending_dns'")
-            .bind(installation_id).bind(scope).bind(digest.as_slice()).fetch_optional(&self.pool).await?.is_some())
+        let row = sqlx::query("SELECT c.generation, i.state FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.token_hash=$3 AND c.revoked_at IS NULL AND c.expires_at > now() ORDER BY c.generation DESC LIMIT 1")
+            .bind(installation_id).bind(scope).bind(digest.as_slice()).fetch_optional(&self.pool).await?;
+        Ok(row.map(|row| (row.get::<i64, _>("generation") as u64, row.get("state"))))
     }
 
     pub async fn hostname(&self, installation_id: Uuid) -> Result<Option<String>, StoreError> {
