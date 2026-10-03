@@ -291,14 +291,6 @@ pub enum AllocationState {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ChallengeLease {
-    pub operation_id: Uuid,
-    pub txt_value: String,
-    pub expires_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CredentialIssueRequest {
     pub scope: Scope,
     /// Client-generated 256-bit bearer secret; only its SHA-256 is sent.
@@ -347,24 +339,46 @@ pub struct RetireRequest {
     pub installation_id: Uuid,
 }
 
+/// Ensure one DNS-01 TXT value is published for the installation's
+/// `_acme-challenge` name. Idempotent: an already-live value is refreshed
+/// (its lifetime restarts) without changing the published set. At most
+/// [`MAX_LIVE_CHALLENGE_VALUES`] values are live at once.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DnsChallengeRequest {
+pub struct DnsChallengeEnsureRequest {
     pub version: u16,
     pub installation_id: Uuid,
-    pub lease: ChallengeLease,
-    pub nonce: String,
-    pub generation: u64,
+    pub txt_value: String,
 }
 
+/// The relay's answer to an ensure: the set revision that includes the value,
+/// to pass to the readiness check, and when the value lapses unless ensured
+/// again.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DnsChallengeDeleteRequest {
+pub struct DnsChallengeState {
     pub version: u16,
-    pub installation_id: Uuid,
-    pub lease_id: Uuid,
-    pub nonce: String,
-    pub generation: u64,
+    pub revision: u64,
+    pub expires_at_ms: u64,
+}
+
+/// How long an ensured TXT value stays published without being ensured again.
+pub const CHALLENGE_VALUE_LIFETIME_MS: u64 = 5 * 60 * 1000;
+/// Live values per installation: one current challenge plus one abandoned by
+/// an interrupted attempt.
+pub const MAX_LIVE_CHALLENGE_VALUES: usize = 2;
+
+/// An ACME DNS-01 TXT value: base64url SHA-256, 43 characters.
+pub fn validate_challenge_value(value: &str) -> Result<(), ProtocolError> {
+    if value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidEncoding)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

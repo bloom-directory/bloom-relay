@@ -9,9 +9,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bloom_relay_protocol::{
     AcmeAccountRequest, AcmeEnvironment, Action, AllocateRequest, Allocation, AllocationReceipt,
     BootstrapChallenge, CertificateMetadata, CredentialIssueReceipt, CredentialIssueRequest,
-    CredentialRenewRequest, DnsChallengeDeleteRequest, DnsChallengeRequest, ErrorCode,
-    ErrorEnvelope, InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION,
-    sha256_hex,
+    CredentialRenewRequest, DnsChallengeEnsureRequest, DnsChallengeState, ErrorCode, ErrorEnvelope,
+    InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex,
 };
 use bloom_relay_store::{DnsJobScope, RestoreWitness, Store};
 use ed25519_dalek::VerifyingKey;
@@ -177,8 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Err(error) = sweeper_store.expire_pending_allocations(100).await {
                 tracing::warn!(%error, "pending allocation sweep failed");
             }
-            if let Err(error) = sweeper_store.expire_challenge_leases(100).await {
-                tracing::warn!(%error, "challenge lease sweep failed");
+            if let Err(error) = sweeper_store.expire_challenge_values(100).await {
+                tracing::warn!(%error, "challenge value sweep failed");
             }
             if let Err(error) = sweeper_store.prune_bootstrap_and_nonces(1_000).await {
                 tracing::warn!(%error, "bootstrap and nonce prune failed");
@@ -206,10 +205,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/v1/installations/status", post(installation_status))
         .route("/v1/installations/retire", post(retire_installation))
         .route("/v1/certificates", post(record_certificate))
-        .route("/v1/dns/challenge", post(create_dns_challenge))
-        .route("/v1/dns/challenge/delete", post(delete_dns_challenge))
+        .route("/v1/dns/challenge", post(ensure_dns_challenge))
         .route(
-            "/v1/dns/challenge/{installation}/{lease}",
+            "/v1/dns/challenge/{installation}/ready/{revision}/{value}",
             get(dns_challenge_ready),
         )
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -380,97 +378,50 @@ async fn register_acme_account(
     Ok(StatusCode::ACCEPTED)
 }
 
-async fn create_dns_challenge(
+async fn ensure_dns_challenge(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<DnsChallengeRequest>,
-) -> Result<StatusCode, ApiError> {
-    if request.version != WIRE_VERSION || request.nonce.len() < 16 || request.nonce.len() > 128 {
+    Json(request): Json<DnsChallengeEnsureRequest>,
+) -> Result<Json<DnsChallengeState>, ApiError> {
+    if request.version != WIRE_VERSION {
         return Err(invalid());
     }
-    authenticate_dns(
-        &state,
-        &headers,
-        request.installation_id,
-        Some(request.generation),
-    )
-    .await?;
-    if !state
+    let generation = authenticate_dns(&state, &headers, request.installation_id, None).await?;
+    let ensured = state
         .store
-        .consume_nonce(request.installation_id, &request.nonce)
-        .await
-        .map_err(|_| unavailable())?
-    {
-        return Err(ApiError(
-            StatusCode::GONE,
-            ErrorCode::ExpiredOrReplayed,
-            false,
-        ));
-    }
-    state
-        .store
-        .create_challenge(request.installation_id, request.generation, &request.lease)
+        .ensure_challenge_value(request.installation_id, generation, &request.txt_value)
         .await
         .map_err(|error| match error {
             bloom_relay_store::StoreError::InvalidRequest => invalid(),
+            // The credential was revoked or expired after authentication.
+            bloom_relay_store::StoreError::Unauthorized => unauthorized(),
+            // Not dns_ready, or two other values are live: retry after one lapses.
             bloom_relay_store::StoreError::Conflict => {
-                ApiError(StatusCode::CONFLICT, ErrorCode::Conflict, false)
+                ApiError(StatusCode::CONFLICT, ErrorCode::Conflict, true)
             }
             _ => unavailable(),
         })?;
-    Ok(StatusCode::ACCEPTED)
-}
-
-async fn delete_dns_challenge(
-    State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Json(request): Json<DnsChallengeDeleteRequest>,
-) -> Result<StatusCode, ApiError> {
-    if request.version != WIRE_VERSION || request.nonce.len() < 16 || request.nonce.len() > 128 {
-        return Err(invalid());
-    }
-    authenticate_dns(
-        &state,
-        &headers,
-        request.installation_id,
-        Some(request.generation),
-    )
-    .await?;
-    if !state
-        .store
-        .consume_nonce(request.installation_id, &request.nonce)
-        .await
-        .map_err(|_| unavailable())?
-    {
-        return Err(ApiError(
-            StatusCode::GONE,
-            ErrorCode::ExpiredOrReplayed,
-            false,
-        ));
-    }
-    state
-        .store
-        .delete_challenge(
-            request.installation_id,
-            request.generation,
-            request.lease_id,
-        )
-        .await
-        .map_err(|_| unavailable())?;
-    Ok(StatusCode::ACCEPTED)
+    Ok(Json(DnsChallengeState {
+        version: WIRE_VERSION,
+        revision: ensured.revision,
+        expires_at_ms: ensured.expires_at_ms,
+    }))
 }
 
 async fn dns_challenge_ready(
     State(state): State<Arc<AppState>>,
-    Path((installation_id, lease_id)): Path<(Uuid, Uuid)>,
+    Path((installation_id, revision, value)): Path<(Uuid, u64, String)>,
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     authenticate_dns(&state, &headers, installation_id, None).await?;
     let ready = state
         .store
-        .challenge_ready(installation_id, lease_id)
+        .challenge_value_ready(installation_id, &value, revision)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|error| match error {
+            bloom_relay_store::StoreError::InvalidRequest => invalid(),
+            _ => unavailable(),
+        })?;
     Ok(if ready {
         StatusCode::NO_CONTENT
     } else {
@@ -760,6 +711,122 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dns_challenge_ensure_and_readiness_follow_the_value_set() {
+        let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        let key = SigningKey::from_bytes(&[23u8; 32]);
+        let id = store
+            .allocate(Uuid::new_v4(), key.verifying_key().to_bytes(), "fixture")
+            .await
+            .unwrap()
+            .installation_id;
+        store
+            .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+            .await
+            .unwrap();
+        store.mark_dns_ready(id).await.unwrap();
+        let token = "t".repeat(43);
+        store
+            .issue_bearer(
+                id,
+                Uuid::new_v4(),
+                "dns_challenge",
+                hex::decode(sha256_hex(token.as_bytes()))
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                3600,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            store: store.clone(),
+            receipt_signer: receipt_signer::ReceiptSigner::Local(key),
+            audience: "relay-control.bloom.directory".into(),
+            placement: "fixture".into(),
+        });
+        let app = Router::new()
+            .route("/v1/dns/challenge", post(ensure_dns_challenge))
+            .route(
+                "/v1/dns/challenge/{installation}/ready/{revision}/{value}",
+                axum::routing::get(dns_challenge_ready),
+            )
+            .with_state(state);
+        let call = |request: Request<Body>| {
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+        let ensure = |bearer: &str, value: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/dns/challenge")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::from(
+                    serde_json::to_vec(&DnsChallengeEnsureRequest {
+                        version: WIRE_VERSION,
+                        installation_id: id,
+                        txt_value: value.to_owned(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        let ready = |value: &str, revision: u64| {
+            Request::builder()
+                .uri(format!("/v1/dns/challenge/{id}/ready/{revision}/{value}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (a, b, c) = ("a".repeat(43), "b".repeat(43), "c".repeat(43));
+        assert_eq!(
+            call(ensure(&"x".repeat(43), &a)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = call(ensure(&token, &a)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let first: DnsChallengeState =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        // A restarted client repeats the same ensure and gets the same revision.
+        let again: DnsChallengeState = serde_json::from_slice(
+            &to_bytes(call(ensure(&token, &a)).await.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again.revision, first.revision);
+        assert_eq!(
+            call(ready(&a, first.revision)).await.status(),
+            StatusCode::ACCEPTED
+        );
+        assert!(
+            store
+                .mark_challenge_reconciled(id, first.revision)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            call(ready(&a, first.revision)).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(call(ensure(&token, &b)).await.status(), StatusCode::OK);
+        let refused = call(ensure(&token, &c)).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            call(ensure(&token, "not-a-value")).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // A revision beyond PostgreSQL's BIGINT is refused, never wrapped.
+        assert_eq!(
+            call(ready(&a, u64::MAX)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

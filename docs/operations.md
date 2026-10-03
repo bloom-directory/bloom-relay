@@ -162,7 +162,7 @@ credentials.
 The local test gate uses disposable PostgreSQL 14 and loopback-only TLS. Run
 `BLOOM_RELAY_TEST_DATABASE_URL=postgres://... cargo test --workspace --locked`
 to exercise opaque Browser TLS forwarding, tunnel reconnect fencing, scoped
-credential rotation, DNS challenge leases, stale restore refusal and the CT
+credential rotation, DNS challenge values, stale restore refusal and the CT
 alert fixture. CI provisions the disposable database. Provider propagation,
 failure, load and incident drills run against a deployment, not in CI; a
 health endpoint or local fixture alone is not readiness evidence.

@@ -2,8 +2,8 @@
 //! A zone-scoped API token is still broader than these code-level ownership checks.
 
 use super::{
-    DnsError, NameRecords, Provider, TTL_SECONDS, TxtLease, caa_values, challenge_name,
-    validate_records,
+    DnsError, NameRecords, Provider, TTL_SECONDS, caa_values, challenge_name,
+    validate_challenge_values, validate_records,
 };
 use bloom_relay_protocol::validate_hostname;
 use reqwest::{Client, Method, StatusCode, Url, redirect::Policy};
@@ -17,6 +17,9 @@ use std::{
 
 const SERVING_COMMENT: &str = "bloom-relay serving v1";
 const CHALLENGE_PREFIX: &str = "bloom-relay challenge v1 ";
+/// Records created for the challenge set; any comment with the prefix
+/// (including per-lease ones written before sets) counts as relay-managed.
+const CHALLENGE_COMMENT: &str = "bloom-relay challenge v1 set";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloudflareScope {
@@ -304,25 +307,6 @@ fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn valid_lease(lease: &TxtLease) -> Result<(), DnsError> {
-    challenge_name(&lease.hostname)?;
-    if lease.lease_id.len() != 36
-        || !lease
-            .lease_id
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() || b == b'-')
-        || lease.value.is_empty()
-        || lease.value.len() > 255
-        || !lease
-            .value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(DnsError::InvalidChange);
-    }
-    Ok(())
-}
-
 fn txt_content(record: &Record) -> &str {
     record
         .content
@@ -373,53 +357,36 @@ impl Provider for CloudflareProvider {
         self.reconcile_serving(&records.hostname, desired).await
     }
 
-    async fn create_txt(&self, lease: TxtLease) -> Result<(), DnsError> {
+    async fn set_challenge(&self, hostname: &str, values: &[String]) -> Result<(), DnsError> {
         self.require(CloudflareScope::Challenge)?;
-        valid_lease(&lease)?;
-        let name = challenge_name(&lease.hostname)?;
-        let comment = format!("{CHALLENGE_PREFIX}{}", lease.lease_id);
-        let mut found = false;
-        for record in self.list(&name).await? {
-            if record.kind != "TXT" {
-                return Err(DnsError::Conflict);
-            }
-            if record.comment == comment {
-                if txt_content(&record) != lease.value {
-                    return Err(DnsError::Conflict);
-                }
-                found = true;
-            }
-            if !record.comment.starts_with(CHALLENGE_PREFIX) {
-                return Err(DnsError::Conflict);
-            }
-        }
-        if found {
-            return Ok(());
-        }
-        self.create(
-            json!({"type":"TXT","name":name,"content":format!("\"{}\"", lease.value),"ttl":60,"comment":comment}),
-        )
-        .await
-    }
-
-    async fn delete_txt(&self, lease: &TxtLease) -> Result<(), DnsError> {
-        self.require(CloudflareScope::Challenge)?;
-        valid_lease(lease)?;
-        let name = challenge_name(&lease.hostname)?;
-        let comment = format!("{CHALLENGE_PREFIX}{}", lease.lease_id);
+        validate_challenge_values(values)?;
+        let name = challenge_name(hostname)?;
         let records = self.list(&name).await?;
-        let matching: Vec<_> = records
-            .into_iter()
-            .filter(|record| record.kind == "TXT" && record.comment == comment)
-            .collect();
-        if matching
+        // Only relay-managed TXT records may exist at the challenge name.
+        if records
             .iter()
-            .any(|record| txt_content(record) != lease.value)
+            .any(|record| record.kind != "TXT" || !record.comment.starts_with(CHALLENGE_PREFIX))
         {
             return Err(DnsError::Conflict);
         }
-        for record in &matching {
+        // Keep one record per desired value; delete duplicates and the rest.
+        let mut kept = std::collections::BTreeSet::new();
+        for record in &records {
+            let value = txt_content(record);
+            if values.iter().any(|wanted| wanted == value) && kept.insert(value.to_owned()) {
+                continue;
+            }
             self.delete(record).await?;
+        }
+        for value in values.iter().filter(|value| !kept.contains(value.as_str())) {
+            self.create(json!({
+                "type": "TXT",
+                "name": name,
+                "content": format!("\"{value}\""),
+                "ttl": 60,
+                "comment": CHALLENGE_COMMENT,
+            }))
+            .await?;
         }
         Ok(())
     }
@@ -525,17 +492,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn txt_rejects_untrusted_content() {
-        let lease = TxtLease {
-            hostname: HOST.into(),
-            lease_id: "00000000-0000-0000-0000-000000000001".into(),
-            value: "token\";bad".into(),
-            expires_at_ms: 1,
-        };
-        assert!(valid_lease(&lease).is_err());
-    }
-
     async fn fixture_with_pages(
         records: Value,
         requests: usize,
@@ -587,27 +543,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_deletes_only_matching_lease_record() {
+    async fn challenge_set_keeps_wanted_values_and_removes_the_rest() {
         let name = format!("_acme-challenge.{HOST}");
-        let old = "00000000-0000-0000-0000-000000000001";
-        let new = "00000000-0000-0000-0000-000000000002";
+        let (keep, stale, add) = ("k".repeat(43), "s".repeat(43), "n".repeat(43));
         let records = json!([
-            {"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":name,"type":"TXT","content":"old","ttl":60,"comment":format!("{CHALLENGE_PREFIX}{old}")},
-            {"id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":name,"type":"TXT","content":"new","ttl":60,"comment":format!("{CHALLENGE_PREFIX}{new}")}
+            {"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":name,"type":"TXT","content":format!("\"{keep}\""),"ttl":60,"comment":CHALLENGE_COMMENT},
+            {"id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":name,"type":"TXT","content":format!("\"{keep}\""),"ttl":60,"comment":CHALLENGE_COMMENT},
+            {"id":"cccccccccccccccccccccccccccccccc","name":name,"type":"TXT","content":format!("\"{stale}\""),"ttl":60,"comment":format!("{CHALLENGE_PREFIX}00000000-0000-0000-0000-000000000001")}
         ]);
-        let (provider, handle) = fixture(records, 2).await;
-        let lease = TxtLease {
-            hostname: HOST.into(),
-            lease_id: old.into(),
-            value: "old".into(),
-            expires_at_ms: 1,
-        };
-        provider.delete_txt(&lease).await.unwrap();
+        let (provider, handle) = fixture(records, 4).await;
+        provider.set_challenge(HOST, &[keep, add]).await.unwrap();
         let requests = handle.await.unwrap();
         assert!(requests[0].starts_with("GET "));
         assert!(requests[0].contains("name.exact="));
-        assert!(requests[1].starts_with("DELETE "));
-        assert!(requests[1].contains("/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "));
+        // The duplicate and the stale per-lease record go; the new value is created.
+        assert!(
+            requests[1].starts_with("DELETE ")
+                && requests[1].contains("/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ")
+        );
+        assert!(
+            requests[2].starts_with("DELETE ")
+                && requests[2].contains("/cccccccccccccccccccccccccccccccc ")
+        );
+        assert!(requests[3].starts_with("POST "));
+    }
+
+    #[tokio::test]
+    async fn challenge_set_refuses_unmanaged_records_without_writing() {
+        let name = format!("_acme-challenge.{HOST}");
+        let records = json!([{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":name,"type":"TXT","content":"\"operator\"","ttl":60,"comment":"operator"}]);
+        let (provider, handle) = fixture(records, 1).await;
+        assert!(matches!(
+            provider.set_challenge(HOST, &[]).await,
+            Err(DnsError::Conflict)
+        ));
+        assert_eq!(handle.await.unwrap().len(), 1);
     }
 
     #[tokio::test]

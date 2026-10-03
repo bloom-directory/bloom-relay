@@ -1,7 +1,8 @@
 //! PostgreSQL authority for durable relay identity, tombstones and generations.
 
 use bloom_relay_protocol::{
-    AcmeEnvironment, Allocation, AllocationState, ChallengeLease, WIRE_VERSION,
+    AcmeEnvironment, Allocation, AllocationState, CHALLENGE_VALUE_LIFETIME_MS,
+    MAX_LIVE_CHALLENGE_VALUES, WIRE_VERSION, validate_challenge_value,
 };
 use data_encoding::BASE32_NOPAD;
 use rand::{RngCore, rngs::OsRng};
@@ -44,6 +45,13 @@ pub struct Store {
     pool: PgPool,
     witness: Option<Arc<RestoreWitness>>,
     acme_environment: AcmeEnvironment,
+}
+
+/// The result of ensuring a challenge value.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ChallengeValueState {
+    pub revision: u64,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -406,6 +414,15 @@ impl Store {
             self.acknowledge().await?;
             return Ok(receipt);
         }
+        // Lock order for credentials: the installation row first, then any
+        // credential row (as issue_bearer and ensure_challenge_value do), so
+        // concurrent renewals, issues and challenge changes cannot deadlock.
+        sqlx::query(
+            "SELECT installation_id FROM installations WHERE installation_id=$1 FOR UPDATE",
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
         // A credential may renew for RENEWAL_GRACE after it expires, so a
         // Broker that slept through its renewal window recovers on wake. Only
         // the newest unrevoked credential for the scope qualifies, so a
@@ -531,139 +548,150 @@ impl Store {
         Ok(())
     }
 
-    pub async fn create_challenge(
+    /// Ensure a DNS-01 TXT value is published for a `dns_ready` installation.
+    /// A live value is refreshed without changing the published set (and so
+    /// without resetting readiness); otherwise it joins the set, lapsed values
+    /// are dropped, the revision advances and a reconciliation is queued. At
+    /// most [`MAX_LIVE_CHALLENGE_VALUES`] distinct values are live at once.
+    pub async fn ensure_challenge_value(
         &self,
         installation_id: Uuid,
         generation: u64,
-        lease: &ChallengeLease,
-    ) -> Result<(), StoreError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| StoreError::InvalidRequest)?
-            .as_millis() as u64;
-        if lease.expires_at_ms <= now_ms
-            || lease.expires_at_ms > now_ms.saturating_add(900_000)
-            || lease.txt_value.len() != 43
-            || !lease
-                .txt_value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err(StoreError::InvalidRequest);
-        }
+        txt_value: &str,
+    ) -> Result<ChallengeValueState, StoreError> {
+        validate_challenge_value(txt_value).map_err(|_| StoreError::InvalidRequest)?;
         let mut tx = self.pool.begin().await?;
+        // The installation row serializes every change to its challenge set.
         sqlx::query("SELECT installation_id FROM installations WHERE installation_id=$1 AND state='dns_ready' FOR UPDATE")
             .bind(installation_id).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
-        let active: i64 = sqlx::query_scalar("SELECT count(*) FROM challenge_leases WHERE installation_id=$1 AND deleted_at IS NULL AND expires_at>now() AND lease_id<>$2")
-            .bind(installation_id).bind(lease.operation_id).fetch_one(&mut *tx).await?;
-        if active != 0 {
-            return Err(StoreError::Conflict);
-        }
-        let existing = sqlx::query("SELECT txt_value,generation FROM challenge_leases WHERE installation_id=$1 AND lease_id=$2")
-            .bind(installation_id).bind(lease.operation_id).fetch_optional(&mut *tx).await?;
-        if let Some(existing) = existing {
-            let value: String = existing.get("txt_value");
-            let observed_generation: i64 = existing.get("generation");
-            if value != lease.txt_value || observed_generation != generation as i64 {
-                return Err(StoreError::Conflict);
-            }
-            drop(tx);
-            self.acknowledge().await?;
-            return Ok(());
-        }
-        sqlx::query("INSERT INTO challenge_leases(installation_id,lease_id,txt_value,generation,expires_at) VALUES ($1,$2,$3,$4,to_timestamp($5::double precision/1000.0))")
-            .bind(installation_id).bind(lease.operation_id).bind(&lease.txt_value).bind(generation as i64).bind(lease.expires_at_ms as i64).execute(&mut *tx).await?;
+        // The authenticating credential must still be current; FOR SHARE
+        // serializes with revocation (installation row first, as elsewhere).
+        sqlx::query("SELECT 1 FROM scoped_bearer_credentials WHERE installation_id=$1 AND scope='dns_challenge' AND generation=$2 AND revoked_at IS NULL AND expires_at>now() FOR SHARE")
+            .bind(installation_id).bind(generation as i64).fetch_optional(&mut *tx).await?
+            .ok_or(StoreError::Unauthorized)?;
         sqlx::query(
-            "INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'publish_txt',$2)",
+            "INSERT INTO challenge_state(installation_id) VALUES ($1) ON CONFLICT DO NOTHING",
         )
         .bind(installation_id)
-        .bind(serde_json::json!({"lease_id":lease.operation_id}))
         .execute(&mut *tx)
         .await?;
-        sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'challenge_created')")
-            .bind(installation_id).bind(lease.operation_id).execute(&mut *tx).await?;
-        tx.commit().await?;
-        self.acknowledge().await?;
-        Ok(())
-    }
-
-    pub async fn delete_challenge(
-        &self,
-        installation_id: Uuid,
-        generation: u64,
-        lease_id: Uuid,
-    ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "SELECT installation_id FROM installations WHERE installation_id=$1 FOR UPDATE",
-        )
-        .bind(installation_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::Conflict)?;
-        let changed = sqlx::query("UPDATE challenge_leases SET deleted_at=now() WHERE installation_id=$1 AND lease_id=$2 AND generation=$3 AND deleted_at IS NULL")
-            .bind(installation_id).bind(lease_id).bind(generation as i64).execute(&mut *tx).await?.rows_affected();
-        if changed > 0 {
+        let lifetime = CHALLENGE_VALUE_LIFETIME_MS as f64 / 1000.0;
+        let refreshed = sqlx::query("UPDATE challenge_values SET expires_at=now()+make_interval(secs=>$3) WHERE installation_id=$1 AND txt_value=$2 AND expires_at>now() RETURNING (extract(epoch FROM expires_at)*1000)::bigint AS expiry")
+            .bind(installation_id).bind(txt_value).bind(lifetime)
+            .fetch_optional(&mut *tx).await?;
+        let expiry: i64 = if let Some(row) = refreshed {
+            row.get("expiry")
+        } else {
+            let live: i64 = sqlx::query_scalar("SELECT count(*) FROM challenge_values WHERE installation_id=$1 AND expires_at>now()")
+                .bind(installation_id).fetch_one(&mut *tx).await?;
+            if live as usize >= MAX_LIVE_CHALLENGE_VALUES {
+                return Err(StoreError::Conflict);
+            }
             sqlx::query(
-                "INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_txt',$2)",
+                "DELETE FROM challenge_values WHERE installation_id=$1 AND expires_at<=now()",
             )
             .bind(installation_id)
-            .bind(serde_json::json!({"lease_id":lease_id}))
             .execute(&mut *tx)
             .await?;
-            sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'challenge_deleted')")
-                .bind(installation_id).bind(lease_id).execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        self.acknowledge().await?;
-        Ok(())
-    }
-
-    pub async fn challenge_for_job(
-        &self,
-        installation_id: Uuid,
-        lease_id: Uuid,
-        cleanup: bool,
-    ) -> Result<Option<ChallengeLease>, StoreError> {
-        // Cleanup always targets this lease's own record, even while a newer
-        // lease is active: the providers delete by lease, never a newer value.
-        let row = sqlx::query("SELECT txt_value,(extract(epoch FROM expires_at)*1000)::bigint AS expiry FROM challenge_leases WHERE installation_id=$1 AND lease_id=$2 AND ($3 OR (deleted_at IS NULL AND expires_at>now()))")
-            .bind(installation_id).bind(lease_id).bind(cleanup).fetch_optional(&self.pool).await?;
-        let Some(row) = row else {
-            return Ok(None);
+            let expiry: i64 = sqlx::query_scalar("INSERT INTO challenge_values(installation_id,txt_value,expires_at) VALUES ($1,$2,now()+make_interval(secs=>$3)) RETURNING (extract(epoch FROM expires_at)*1000)::bigint")
+                .bind(installation_id).bind(txt_value).bind(lifetime)
+                .fetch_one(&mut *tx).await?;
+            Self::challenge_set_changed(&mut tx, installation_id, "challenge_value_added").await?;
+            expiry
         };
-        let expiry: i64 = row.try_get("expiry")?;
-        Ok(Some(ChallengeLease {
-            operation_id: lease_id,
-            txt_value: row.try_get("txt_value")?,
-            expires_at_ms: expiry.try_into().map_err(|_| StoreError::InvalidRequest)?,
-        }))
-    }
-
-    pub async fn mark_challenge_ready(
-        &self,
-        installation_id: Uuid,
-        lease_id: Uuid,
-    ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE challenge_leases SET dns_ready_at=now() WHERE installation_id=$1 AND lease_id=$2 AND dns_ready_at IS NULL AND deleted_at IS NULL AND expires_at>now()")
-            .bind(installation_id).bind(lease_id).execute(&mut *tx).await?.rows_affected();
-        if changed > 0 {
-            sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'challenge_dns_ready')")
-                .bind(installation_id).bind(lease_id).execute(&mut *tx).await?;
-        }
+        let revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM challenge_state WHERE installation_id=$1")
+                .bind(installation_id)
+                .fetch_one(&mut *tx)
+                .await?;
         tx.commit().await?;
         self.acknowledge().await?;
+        Ok(ChallengeValueState {
+            revision: revision as u64,
+            expires_at_ms: expiry as u64,
+        })
+    }
+
+    /// Advance the set's revision, queue its reconciliation and audit the
+    /// change. Each change queues its own job: a worker that finishes an older
+    /// revision never consumes the request for a newer one.
+    async fn challenge_set_changed(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        installation_id: Uuid,
+        event: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE challenge_state SET revision=revision+1 WHERE installation_id=$1")
+            .bind(installation_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'reconcile_txt','{}'::jsonb)")
+            .bind(installation_id).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO security_audit(installation_id,event) VALUES ($1,$2)")
+            .bind(installation_id)
+            .bind(event)
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 
-    pub async fn challenge_ready(
+    /// Whether `txt_value` is live and the published set, at or after
+    /// `revision`, has been observed on DNS.
+    pub async fn challenge_value_ready(
         &self,
         installation_id: Uuid,
-        lease_id: Uuid,
+        txt_value: &str,
+        revision: u64,
     ) -> Result<bool, StoreError> {
-        Ok(sqlx::query("SELECT 1 FROM challenge_leases WHERE installation_id=$1 AND lease_id=$2 AND dns_ready_at IS NOT NULL AND deleted_at IS NULL AND expires_at>now()")
-            .bind(installation_id).bind(lease_id).fetch_optional(&self.pool).await?.is_some())
+        let revision = i64::try_from(revision).map_err(|_| StoreError::InvalidRequest)?;
+        Ok(sqlx::query("SELECT 1 FROM challenge_state s JOIN challenge_values v USING (installation_id) WHERE s.installation_id=$1 AND v.txt_value=$2 AND v.expires_at>now() AND s.ready_revision=s.revision AND s.ready_revision>=$3")
+            .bind(installation_id).bind(txt_value).bind(revision)
+            .fetch_optional(&self.pool).await?.is_some())
+    }
+
+    /// The set the challenge worker should publish: the revision and stored
+    /// membership, in one snapshot. Lapsed values stay until an ensure or the
+    /// sweep removes them (both advance the revision), so a concurrent refresh
+    /// can never be dropped from a revision that is then marked ready.
+    pub async fn challenge_target(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<(u64, Vec<String>), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let revision: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM challenge_state WHERE installation_id=$1")
+                .bind(installation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let values: Vec<String> = sqlx::query_scalar(
+            "SELECT txt_value FROM challenge_values WHERE installation_id=$1 ORDER BY txt_value",
+        )
+        .bind(installation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((revision.unwrap_or(0) as u64, values))
+    }
+
+    /// Record that `revision` is published and observed. Returns false when the
+    /// set changed meanwhile; that change queued its own reconciliation.
+    pub async fn mark_challenge_reconciled(
+        &self,
+        installation_id: Uuid,
+        revision: u64,
+    ) -> Result<bool, StoreError> {
+        let changed = sqlx::query(
+            "UPDATE challenge_state SET ready_revision=$2 WHERE installation_id=$1 AND revision=$2",
+        )
+        .bind(installation_id)
+        .bind(revision as i64)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        self.acknowledge().await?;
+        Ok(changed == 1)
     }
 
     pub async fn claim_job(
@@ -672,7 +700,7 @@ impl Store {
         scope: DnsJobScope,
     ) -> Result<Option<OutboxJob>, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT o.id, o.installation_id, o.kind, o.payload FROM outbox o JOIN installations i USING (installation_id) WHERE i.placement=$1 AND (($2='serving' AND o.kind IN ('publish_name','remove_records')) OR ($2='challenge' AND o.kind IN ('publish_txt','remove_txt','remove_txt_all'))) AND o.completed_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
+        let row = sqlx::query("SELECT o.id, o.installation_id, o.kind, o.payload FROM outbox o JOIN installations i USING (installation_id) WHERE i.placement=$1 AND (($2='serving' AND o.kind IN ('publish_name','remove_records')) OR ($2='challenge' AND o.kind IN ('reconcile_txt','remove_txt_all'))) AND o.completed_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
             .bind(placement).bind(scope.as_str()).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
@@ -846,31 +874,39 @@ impl Store {
         Ok(expired)
     }
 
-    pub async fn expire_challenge_leases(&self, limit: i64) -> Result<usize, StoreError> {
+    /// Drop lapsed challenge values, one installation per transaction, so the
+    /// published sets shrink back. Returns the installations changed.
+    pub async fn expire_challenge_values(&self, limit: i64) -> Result<usize, StoreError> {
         if !(1..=100).contains(&limit) {
             return Err(StoreError::InvalidRequest);
         }
-        let mut tx = self.pool.begin().await?;
-        let rows = sqlx::query("SELECT installation_id,lease_id FROM challenge_leases WHERE deleted_at IS NULL AND expires_at<=now() ORDER BY expires_at FOR UPDATE SKIP LOCKED LIMIT $1")
-            .bind(limit).fetch_all(&mut *tx).await?;
-        for row in &rows {
-            let id: Uuid = row.get("installation_id");
-            let lease_id: Uuid = row.get("lease_id");
-            sqlx::query("UPDATE challenge_leases SET deleted_at=now() WHERE installation_id=$1 AND lease_id=$2")
-                .bind(id).bind(lease_id).execute(&mut *tx).await?;
+        let installations: Vec<Uuid> = sqlx::query_scalar("SELECT DISTINCT installation_id FROM challenge_values WHERE expires_at<=now() LIMIT $1")
+            .bind(limit).fetch_all(&self.pool).await?;
+        let mut changed = 0;
+        for installation_id in installations {
+            let mut tx = self.pool.begin().await?;
             sqlx::query(
-                "INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_txt',$2)",
+                "SELECT installation_id FROM installations WHERE installation_id=$1 FOR UPDATE",
             )
-            .bind(id)
-            .bind(serde_json::json!({"lease_id":lease_id}))
+            .bind(installation_id)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'challenge_expired')")
-                .bind(id).bind(lease_id).execute(&mut *tx).await?;
+            let removed = sqlx::query(
+                "DELETE FROM challenge_values WHERE installation_id=$1 AND expires_at<=now()",
+            )
+            .bind(installation_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if removed > 0 {
+                Self::challenge_set_changed(&mut tx, installation_id, "challenge_value_expired")
+                    .await?;
+                changed += 1;
+            }
+            tx.commit().await?;
+            self.acknowledge().await?;
         }
-        tx.commit().await?;
-        self.acknowledge().await?;
-        Ok(rows.len())
+        Ok(changed)
     }
 
     pub async fn retire(
@@ -917,6 +953,10 @@ impl Store {
                 .bind(installation_id).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO outbox(installation_id,kind,payload) VALUES ($1,'remove_txt_all','{}'::jsonb)")
                 .bind(installation_id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM challenge_values WHERE installation_id=$1")
+                .bind(installation_id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("INSERT INTO security_audit(installation_id,operation_id,event) VALUES ($1,$2,'retired')")
                 .bind(installation_id).bind(operation_id).execute(&mut *tx).await?;
         }

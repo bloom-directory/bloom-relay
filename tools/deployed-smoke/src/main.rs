@@ -4,7 +4,7 @@ use bloom_relay_admin_client::{
     register_acme_account, retire_installation,
 };
 use bloom_relay_client::{CEREMONY_UPSTREAM, DnsChallengeClient, TunnelClient, TunnelConfig};
-use bloom_relay_protocol::{Allocation, AllocationState, ChallengeLease, Scope};
+use bloom_relay_protocol::{Allocation, AllocationState, Scope};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::{RngCore, rngs::OsRng};
 use rustls::{
@@ -18,7 +18,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tempfile::TempDir;
 use tokio::{
@@ -132,7 +132,7 @@ async fn run_enrolled(
     );
 
     let dns_token = SecretToken::generate();
-    let dns_receipt = issue_credential(
+    issue_credential(
         enrollment_config(inputs),
         allocation.installation_id,
         Scope::DnsChallenge,
@@ -168,21 +168,18 @@ async fn run_enrolled(
     let dns = DnsChallengeClient::new(
         inputs.control_ca.clone(),
         allocation.installation_id,
-        dns_receipt.generation,
         dns_path,
     )
     .context("DNS client setup failed")?;
-    let lease_id = Uuid::new_v4();
-    let lease = ChallengeLease {
-        operation_id: lease_id,
-        txt_value: random_dns_value(),
-        expires_at_ms: now_ms().saturating_add(300_000),
-    };
+    let txt_value = random_dns_value();
     let dns_result = async {
-        dns.create(lease).await.context("DNS lease create failed")?;
-        await_challenge_ready(&dns, lease_id, allocation).await?;
+        let ensured = dns
+            .ensure(&txt_value)
+            .await
+            .context("DNS challenge ensure failed")?;
+        await_challenge_ready(&dns, &txt_value, ensured.revision, allocation).await?;
         println!(
-            "PASS dns-lease-ready {} {}",
+            "PASS dns-challenge-ready {} {}",
             allocation.installation_id, allocation.hostname
         );
 
@@ -227,18 +224,8 @@ async fn run_enrolled(
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    let cleanup = dns
-        .delete(lease_id)
-        .await
-        .context("DNS lease cleanup failed");
-    if cleanup.is_ok() {
-        println!(
-            "PASS dns-lease-delete {} {}",
-            allocation.installation_id, allocation.hostname
-        );
-    }
-    dns_result?;
-    cleanup
+    // The value lapses on its own five minutes after the last ensure.
+    dns_result
 }
 
 fn signer(key: &SigningKey) -> impl Fn(&[u8]) -> Result<[u8; 64], EnrollmentError> + '_ {
@@ -388,29 +375,30 @@ async fn await_dns_ready(inputs: &Inputs, key: &SigningKey, allocation: &Allocat
 
 async fn await_challenge_ready(
     client: &DnsChallengeClient,
-    lease_id: Uuid,
+    txt_value: &str,
+    revision: u64,
     allocation: &Allocation,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + POLL_LIMIT;
     let mut attempts = 0u32;
     while tokio::time::Instant::now() < deadline {
         if client
-            .ready(lease_id)
+            .ready(txt_value, revision)
             .await
-            .context("DNS lease status failed")?
+            .context("DNS challenge status failed")?
         {
             return Ok(());
         }
         if attempts.is_multiple_of(15) {
             println!(
-                "WAIT dns-lease {} {}",
+                "WAIT dns-challenge {} {}",
                 allocation.installation_id, allocation.hostname
             );
         }
         attempts += 1;
         sleep(Duration::from_secs(2)).await;
     }
-    bail!("DNS lease readiness timed out")
+    bail!("DNS challenge readiness timed out")
 }
 
 async fn start_tunnel(config: TunnelConfig) -> Result<TunnelRun> {
@@ -574,10 +562,4 @@ fn random_dns_value() -> String {
     OsRng.fill_bytes(&mut value);
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     URL_SAFE_NO_PAD.encode(value)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |value| value.as_millis() as u64)
 }
