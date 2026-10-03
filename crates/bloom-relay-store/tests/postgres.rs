@@ -495,11 +495,20 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
             .unwrap()
     );
     // A lapsed value stays in the published set, at the same revision, until
-    // an ensure or the sweep removes it; it is never reported ready.
-    assert_eq!(
-        store.challenge_target(id).await.unwrap(),
-        (second.revision, vec![a.clone(), b.clone()])
-    );
+    // an ensure or the sweep removes it (other tests sweep concurrently), and
+    // is never reported ready. Membership and revision always move together.
+    let (revision, published) = store.challenge_target(id).await.unwrap();
+    if published.contains(&a) {
+        assert_eq!(
+            (revision, published),
+            (second.revision, vec![a.clone(), b.clone()])
+        );
+    } else {
+        assert_eq!(
+            (revision, published),
+            (second.revision + 1, vec![b.clone()])
+        );
+    }
     let third = store
         .ensure_challenge_value(id, generation, &c)
         .await
@@ -524,8 +533,9 @@ async fn challenge_values_form_a_bounded_refreshable_set_with_revisioned_readine
     .fetch_one(store.pool())
     .await
     .unwrap();
+    let (final_revision, _) = store.challenge_target(id).await.unwrap();
     assert_eq!(
-        jobs, 4,
+        jobs as u64, final_revision,
         "every membership change queues its own reconciliation"
     );
 
