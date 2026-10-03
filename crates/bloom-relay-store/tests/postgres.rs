@@ -631,6 +631,16 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
         .unwrap()
         .unwrap();
     assert_eq!(first_job.installation_id, id);
+    // A job re-checks quickly at first (5 s, doubling to a 300 s cap): most DNS
+    // changes are visible on the first re-check.
+    let retry_in: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM next_attempt_at-now())::double precision FROM outbox WHERE id=$1",
+    )
+    .bind(first_job.id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert!((3.0..=5.5).contains(&retry_in), "{retry_in}");
     store.complete_job(first_job.id).await.unwrap();
     store
         .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")

@@ -295,6 +295,22 @@ impl Store {
         Ok(row.map(|row| row.get::<i64, _>("generation") as u64))
     }
 
+    /// Whether `bearer` is a current credential of an installation whose
+    /// serving DNS is still pending: the caller is right, just early.
+    pub async fn bearer_awaiting_dns(
+        &self,
+        installation_id: Uuid,
+        scope: &str,
+        bearer: &str,
+    ) -> Result<bool, StoreError> {
+        if bearer.len() < 43 || bearer.len() > 128 || !matches!(scope, "tunnel" | "dns_challenge") {
+            return Ok(false);
+        }
+        let digest = Sha256::digest(bearer.as_bytes());
+        Ok(sqlx::query("SELECT 1 FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.token_hash=$3 AND c.revoked_at IS NULL AND c.expires_at > now() AND i.state='pending_dns'")
+            .bind(installation_id).bind(scope).bind(digest.as_slice()).fetch_optional(&self.pool).await?.is_some())
+    }
+
     pub async fn hostname(&self, installation_id: Uuid) -> Result<Option<String>, StoreError> {
         let row = sqlx::query(
             "SELECT hostname FROM installations WHERE installation_id=$1 AND state='dns_ready'",
@@ -706,7 +722,7 @@ impl Store {
             return Ok(None);
         };
         let id: i64 = row.get("id");
-        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+make_interval(secs=>GREATEST(60,LEAST(300,POWER(2,LEAST(8,attempts+1)))::int)) WHERE id=$1")
+        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,attempts)))::int) WHERE id=$1")
             .bind(id).execute(&mut *tx).await?;
         let job = OutboxJob {
             id,

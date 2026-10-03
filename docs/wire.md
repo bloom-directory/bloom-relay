@@ -113,6 +113,9 @@ client lease identities and no delete:
   expiry. At most two values are live; a third distinct value is refused with
   409 until one lapses. Ensure again before expiry to keep a value published
   while ACME validates; abandoned values simply lapse.
+- Before the installation's serving DNS is ready, DNS-challenge and
+  certificate calls with a valid credential get 409 (retryable), not 401;
+  retry shortly. Provisioning publishes serving DNS within about a minute.
 - `GET /v1/dns/challenge/{installation}/ready/{revision}/{value}` returns 204
   when the value is live and the published set at that revision or later has
   been observed on DNS, otherwise 202.

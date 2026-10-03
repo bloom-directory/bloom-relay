@@ -264,12 +264,25 @@ async fn authenticate_dns(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(unauthorized)?;
-    let observed = state
+    let Some(observed) = state
         .store
         .authenticate_bearer(installation_id, "dns_challenge", bearer)
         .await
         .map_err(|_| unavailable())?
-        .ok_or_else(unauthorized)?;
+    else {
+        // A valid credential whose installation's serving DNS is still being
+        // published is early, not unauthorized: tell the client to retry.
+        let early = state
+            .store
+            .bearer_awaiting_dns(installation_id, "dns_challenge", bearer)
+            .await
+            .map_err(|_| unavailable())?;
+        return Err(if early {
+            ApiError(StatusCode::CONFLICT, ErrorCode::Conflict, true)
+        } else {
+            unauthorized()
+        });
+    };
     if generation.is_some_and(|value| value != observed) {
         return Err(unauthorized());
     }
@@ -729,7 +742,6 @@ mod tests {
             .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
             .await
             .unwrap();
-        store.mark_dns_ready(id).await.unwrap();
         let token = "t".repeat(43);
         store
             .issue_bearer(
@@ -785,6 +797,17 @@ mod tests {
                 .unwrap()
         };
         let (a, b, c) = ("a".repeat(43), "b".repeat(43), "c".repeat(43));
+        // Before serving DNS is ready a valid credential is early, not
+        // unauthorized: 409 (retryable), while a wrong token stays 401.
+        assert_eq!(
+            call(ensure(&token, &a)).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            call(ensure(&"x".repeat(43), &a)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        store.mark_dns_ready(id).await.unwrap();
         assert_eq!(
             call(ensure(&"x".repeat(43), &a)).await.status(),
             StatusCode::UNAUTHORIZED
