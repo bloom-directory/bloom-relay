@@ -81,11 +81,13 @@ impl DnsWorker {
                             }
                         }
                         Ok(false) => {
-                            bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total")
+                            bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total");
+                            self.defer(id).await;
                         }
                         Err(error) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_failed_total");
                             tracing::warn!(job_id=id, error=%error, "DNS job will retry");
+                            self.defer(id).await;
                         }
                     }
                 }
@@ -95,6 +97,15 @@ impl DnsWorker {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
+        }
+    }
+
+    /// Bring an unfinished job's next attempt forward from its 120 s claim
+    /// lease to the short retry backoff. If this fails the lease still lets
+    /// the job be retried, just later.
+    async fn defer(&self, id: i64) {
+        if let Err(error) = self.store.defer_job(id).await {
+            tracing::warn!(job_id=id, error=%error, "DNS job reschedule failed");
         }
     }
 

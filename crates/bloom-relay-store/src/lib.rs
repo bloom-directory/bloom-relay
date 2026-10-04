@@ -725,7 +725,7 @@ impl Store {
             return Ok(None);
         };
         let id: i64 = row.get("id");
-        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,attempts)))::int) WHERE id=$1")
+        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+interval '120 seconds' WHERE id=$1")
             .bind(id).execute(&mut *tx).await?;
         let job = OutboxJob {
             id,
@@ -736,6 +736,18 @@ impl Store {
         tx.commit().await?;
         self.acknowledge().await?;
         Ok(Some(job))
+    }
+
+    /// Reschedule a claimed job that is not done yet (change not visible yet,
+    /// or a transient failure): 5 s after the first attempt, doubling to a
+    /// 300 s cap. Claiming sets a separate 120 s processing lease, so a job
+    /// still being processed is never claimed twice.
+    pub async fn defer_job(&self, id: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE outbox SET next_attempt_at=now()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,GREATEST(attempts-1,0))))::int) WHERE id=$1 AND completed_at IS NULL")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn complete_job(&self, id: i64) -> Result<(), StoreError> {
