@@ -5,6 +5,9 @@ use bloom_relay_dns::{
 use bloom_relay_store::{DnsJobScope, OutboxJob, Store};
 use std::{env, io::Read, net::IpAddr, time::Duration};
 
+/// Longest a single DNS job attempt may run; below the 120 s claim lease.
+const JOB_ATTEMPT_DEADLINE: Duration = Duration::from_secs(90);
+
 pub struct DnsWorker {
     store: Store,
     placement: String,
@@ -72,8 +75,15 @@ impl DnsWorker {
             }
             match self.store.claim_job(&self.placement, self.scope).await {
                 Ok(Some(job)) => {
-                    let id = job.id;
-                    match self.process(job).await {
+                    let (id, attempt) = (job.id, job.attempt);
+                    // Bounded below the claim's 120 s lease, so no other
+                    // worker can claim a job whose attempt is still running.
+                    // An abandoned attempt drops its transaction (and the
+                    // advisory lock); provider writes are idempotent.
+                    let outcome = tokio::time::timeout(JOB_ATTEMPT_DEADLINE, self.process(job))
+                        .await
+                        .unwrap_or_else(|_| Err("DNS job attempt exceeded its deadline".into()));
+                    match outcome {
                         Ok(true) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_completed_total");
                             if let Err(error) = self.store.complete_job(id).await {
@@ -82,12 +92,12 @@ impl DnsWorker {
                         }
                         Ok(false) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total");
-                            self.defer(id).await;
+                            self.defer(id, attempt).await;
                         }
                         Err(error) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_failed_total");
                             tracing::warn!(job_id=id, error=%error, "DNS job will retry");
-                            self.defer(id).await;
+                            self.defer(id, attempt).await;
                         }
                     }
                 }
@@ -103,8 +113,8 @@ impl DnsWorker {
     /// Bring an unfinished job's next attempt forward from its 120 s claim
     /// lease to the short retry backoff. If this fails the lease still lets
     /// the job be retried, just later.
-    async fn defer(&self, id: i64) {
-        if let Err(error) = self.store.defer_job(id).await {
+    async fn defer(&self, id: i64, attempt: i32) {
+        if let Err(error) = self.store.defer_job(id, attempt).await {
             tracing::warn!(job_id=id, error=%error, "DNS job reschedule failed");
         }
     }

@@ -653,7 +653,19 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
             .is_none(),
         "a leased job is not claimed twice"
     );
-    store.defer_job(first_job.id).await.unwrap();
+    // A stale claim cannot reschedule the job; the current one can.
+    store
+        .defer_job(first_job.id, first_job.attempt - 1)
+        .await
+        .unwrap();
+    assert!(
+        retry_in().await > 100.0,
+        "a stale claim must not shorten the lease"
+    );
+    store
+        .defer_job(first_job.id, first_job.attempt)
+        .await
+        .unwrap();
     let deferred = retry_in().await;
     assert!((3.0..=5.5).contains(&deferred), "{deferred}");
     store.complete_job(first_job.id).await.unwrap();

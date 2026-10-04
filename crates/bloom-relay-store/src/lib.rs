@@ -57,6 +57,8 @@ pub struct ChallengeValueState {
 #[derive(Debug)]
 pub struct OutboxJob {
     pub id: i64,
+    /// The attempt this claim made; identifies the claim for `defer_job`.
+    pub attempt: i32,
     pub installation_id: Uuid,
     pub kind: String,
     pub payload: serde_json::Value,
@@ -725,10 +727,13 @@ impl Store {
             return Ok(None);
         };
         let id: i64 = row.get("id");
-        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+interval '120 seconds' WHERE id=$1")
-            .bind(id).execute(&mut *tx).await?;
+        // The claim leases the job for longer than any attempt may run (the
+        // worker abandons an attempt after JOB_ATTEMPT_DEADLINE).
+        let attempt: i32 = sqlx::query_scalar("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+interval '120 seconds' WHERE id=$1 RETURNING attempts")
+            .bind(id).fetch_one(&mut *tx).await?;
         let job = OutboxJob {
             id,
+            attempt,
             installation_id: row.get("installation_id"),
             kind: row.get("kind"),
             payload: row.get("payload"),
@@ -738,13 +743,14 @@ impl Store {
         Ok(Some(job))
     }
 
-    /// Reschedule a claimed job that is not done yet (change not visible yet,
-    /// or a transient failure): 5 s after the first attempt, doubling to a
-    /// 300 s cap. Claiming sets a separate 120 s processing lease, so a job
-    /// still being processed is never claimed twice.
-    pub async fn defer_job(&self, id: i64) -> Result<(), StoreError> {
-        sqlx::query("UPDATE outbox SET next_attempt_at=now()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,GREATEST(attempts-1,0))))::int) WHERE id=$1 AND completed_at IS NULL")
+    /// Reschedule an unfinished job (change not visible yet, or a transient
+    /// failure): 5 s after the first attempt, doubling to a 300 s cap. Applies
+    /// only while `attempt` is still the job's latest claim, so a stale worker
+    /// cannot shorten another worker's lease.
+    pub async fn defer_job(&self, id: i64, attempt: i32) -> Result<(), StoreError> {
+        sqlx::query("UPDATE outbox SET next_attempt_at=now()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,GREATEST(attempts-1,0))))::int) WHERE id=$1 AND attempts=$2 AND completed_at IS NULL")
             .bind(id)
+            .bind(attempt)
             .execute(&self.pool)
             .await?;
         Ok(())
