@@ -5,9 +5,6 @@ use bloom_relay_dns::{
 use bloom_relay_store::{DnsJobScope, OutboxJob, Store};
 use std::{env, io::Read, net::IpAddr, time::Duration};
 
-/// Longest a single DNS job attempt may run; below the 120 s claim lease.
-const JOB_ATTEMPT_DEADLINE: Duration = Duration::from_secs(90);
-
 pub struct DnsWorker {
     store: Store,
     placement: String,
@@ -76,21 +73,17 @@ impl DnsWorker {
             match self.store.claim_job(&self.placement, self.scope).await {
                 Ok(Some(job)) => {
                     let (id, attempt) = (job.id, job.attempt);
-                    // Bounded below the claim's 120 s lease, so no other
-                    // worker can claim a job whose attempt is still running.
-                    // An abandoned attempt drops its transaction (and the
-                    // advisory lock); provider writes are idempotent.
-                    let outcome = tokio::time::timeout(JOB_ATTEMPT_DEADLINE, self.process(job))
-                        .await
-                        .unwrap_or_else(|_| Err("DNS job attempt exceeded its deadline".into()));
-                    match outcome {
-                        Ok(true) => {
+                    match self.process(job).await {
+                        // Another claim took the job over (or completed it)
+                        // while this one waited for the installation lock.
+                        Ok(None) => {}
+                        Ok(Some(true)) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_completed_total");
                             if let Err(error) = self.store.complete_job(id).await {
                                 tracing::warn!(job_id=id, error=%error, "DNS job completion failed");
                             }
                         }
-                        Ok(false) => {
+                        Ok(Some(false)) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total");
                             self.defer(id, attempt).await;
                         }
@@ -122,7 +115,7 @@ impl DnsWorker {
     async fn process(
         &self,
         job: OutboxJob,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
         // Serialize provider writes with operator placement moves. The advisory
         // lock has transaction lifetime, including DNS observation.
         let mut lock = self.store.pool().begin().await?;
@@ -130,7 +123,21 @@ impl DnsWorker {
             .bind(job.installation_id.to_string())
             .execute(&mut *lock)
             .await?;
-        let result = self.process_locked(job).await;
+        // Exclusivity comes from this lock, not the claim lease: if the job
+        // was completed, or claimed again after this claim's lease lapsed,
+        // while this attempt waited, it writes nothing and leaves the job alone.
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE id=$1 AND attempts=$2 AND completed_at IS NULL)",
+        )
+        .bind(job.id)
+        .bind(job.attempt)
+        .fetch_one(&mut *lock)
+        .await?;
+        if !current {
+            lock.commit().await?;
+            return Ok(None);
+        }
+        let result = self.process_locked(job).await.map(Some);
         self.store.verify_integrity().await?;
         lock.commit().await?;
         result

@@ -727,8 +727,9 @@ impl Store {
             return Ok(None);
         };
         let id: i64 = row.get("id");
-        // The claim leases the job for longer than any attempt may run (the
-        // worker abandons an attempt after JOB_ATTEMPT_DEADLINE).
+        // The claim leases the job so no other worker starts it meanwhile; the
+        // worker's installation lock and claim re-check make a late reclaim
+        // harmless (it waits, then finds the job completed or itself current).
         let attempt: i32 = sqlx::query_scalar("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+interval '120 seconds' WHERE id=$1 RETURNING attempts")
             .bind(id).fetch_one(&mut *tx).await?;
         let job = OutboxJob {
