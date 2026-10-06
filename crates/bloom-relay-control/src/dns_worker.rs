@@ -71,25 +71,29 @@ impl DnsWorker {
                 bloom_relay_observe::gauge("bloom_relay_dns_job_lag_seconds", seconds.max(0.0));
             }
             match self.store.claim_job(&self.placement, self.scope).await {
-                Ok(Some(job)) => {
-                    let (id, attempt) = (job.id, job.attempt);
-                    match self.process(job).await {
-                        // Another claim took the job over (or completed it)
-                        // while this one waited for the installation lock.
-                        Ok(None) => {}
-                        // Completed inside `process`, under the installation lock.
-                        Ok(Some(true)) => {
+                Ok(Some(claimed)) => {
+                    // The claim holds the job and the installation lock until
+                    // its outcome is recorded below.
+                    let id = claimed.job.id;
+                    let outcome = match self.process(&claimed.job).await {
+                        Ok(true) => claimed.complete(&self.store).await.map(|()| {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_completed_total");
-                        }
-                        Ok(Some(false)) => {
+                        }),
+                        Ok(false) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total");
-                            self.defer(id, attempt).await;
+                            claimed.defer().await
                         }
                         Err(error) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_failed_total");
                             tracing::warn!(job_id=id, error=%error, "DNS job will retry");
-                            self.defer(id, attempt).await;
+                            claimed.defer().await
                         }
+                    };
+                    // Unrecorded, the attempt rolls back: the job is free
+                    // again and retried at its existing schedule.
+                    if let Err(error) = outcome {
+                        tracing::warn!(job_id=id, error=%error, "DNS job outcome not recorded");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -101,55 +105,9 @@ impl DnsWorker {
         }
     }
 
-    /// Bring an unfinished job's next attempt forward from its 120 s claim
-    /// lease to the short retry backoff. If this fails the lease still lets
-    /// the job be retried, just later.
-    async fn defer(&self, id: i64, attempt: i32) {
-        if let Err(error) = self.store.defer_job(id, attempt).await {
-            tracing::warn!(job_id=id, error=%error, "DNS job reschedule failed");
-        }
-    }
-
     async fn process(
         &self,
-        job: OutboxJob,
-    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
-        // Serialize provider writes with operator placement moves. The advisory
-        // lock has transaction lifetime, including DNS observation.
-        let mut lock = self.store.pool().begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(job.installation_id.to_string())
-            .execute(&mut *lock)
-            .await?;
-        // Exclusivity comes from this lock, not the claim lease: if the job
-        // was completed, or claimed again after this claim's lease lapsed,
-        // while this attempt waited, it writes nothing and leaves the job alone.
-        let current: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM outbox WHERE id=$1 AND attempts=$2 AND completed_at IS NULL)",
-        )
-        .bind(job.id)
-        .bind(job.attempt)
-        .fetch_one(&mut *lock)
-        .await?;
-        if !current {
-            lock.commit().await?;
-            return Ok(None);
-        }
-        let (id, attempt) = (job.id, job.attempt);
-        let result = self.process_locked(job).await.map(Some);
-        if matches!(result, Ok(Some(true))) {
-            // Complete while still holding the lock, and only for this claim,
-            // so a reclaim waiting on the lock always sees the job completed.
-            self.store.complete_job(id, attempt).await?;
-        }
-        self.store.verify_integrity().await?;
-        lock.commit().await?;
-        result
-    }
-
-    async fn process_locked(
-        &self,
-        job: OutboxJob,
+        job: &OutboxJob,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let installation = job.installation_id;
         if !job_allowed(self.scope, &job.kind) {

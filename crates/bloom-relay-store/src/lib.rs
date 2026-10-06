@@ -57,11 +57,44 @@ pub struct ChallengeValueState {
 #[derive(Debug)]
 pub struct OutboxJob {
     pub id: i64,
-    /// The attempt this claim made; identifies the claim for `defer_job`.
-    pub attempt: i32,
     pub installation_id: Uuid,
     pub kind: String,
     pub payload: serde_json::Value,
+}
+
+/// A job held for one attempt. Its transaction keeps the outbox row locked
+/// (other workers skip it) and the installation's lock held (placement moves
+/// and retirement wait) until the attempt is recorded with `complete` or
+/// `defer`. Dropping it, or the process dying, rolls back and frees the job
+/// for an immediate retry.
+pub struct ClaimedJob {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    pub job: OutboxJob,
+}
+
+impl ClaimedJob {
+    /// Record the job as done and release it.
+    pub async fn complete(mut self, store: &Store) -> Result<(), StoreError> {
+        store.verify_integrity().await?;
+        sqlx::query("UPDATE outbox SET completed_at=now() WHERE id=$1")
+            .bind(self.job.id)
+            .execute(&mut *self.tx)
+            .await?;
+        self.tx.commit().await?;
+        store.acknowledge().await
+    }
+
+    /// Record an unfinished attempt (change not visible yet, or a transient
+    /// failure) and release the job: retried 5 s after the first attempt,
+    /// doubling to a 300 s cap.
+    pub async fn defer(mut self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,attempts)))::int) WHERE id=$1")
+            .bind(self.job.id)
+            .execute(&mut *self.tx)
+            .await?;
+        self.tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -715,58 +748,34 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Claim the next due job and hold it for one attempt (see `ClaimedJob`).
+    /// Lock order: the job row, then the installation lock; nothing else
+    /// takes an outbox row lock, so waiting here cannot deadlock.
     pub async fn claim_job(
         &self,
         placement: &str,
         scope: DnsJobScope,
-    ) -> Result<Option<OutboxJob>, StoreError> {
+    ) -> Result<Option<ClaimedJob>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT o.id, o.installation_id, o.kind, o.payload FROM outbox o JOIN installations i USING (installation_id) WHERE i.placement=$1 AND (($2='serving' AND o.kind IN ('publish_name','remove_records')) OR ($2='challenge' AND o.kind IN ('reconcile_txt','remove_txt_all'))) AND o.completed_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
             .bind(placement).bind(scope.as_str()).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let id: i64 = row.get("id");
-        // The claim leases the job so no other worker starts it meanwhile; the
-        // worker's installation lock and claim re-check make a late reclaim
-        // harmless (it waits, then finds the job completed or itself current).
-        let attempt: i32 = sqlx::query_scalar("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+interval '120 seconds' WHERE id=$1 RETURNING attempts")
-            .bind(id).fetch_one(&mut *tx).await?;
         let job = OutboxJob {
-            id,
-            attempt,
+            id: row.get("id"),
             installation_id: row.get("installation_id"),
             kind: row.get("kind"),
             payload: row.get("payload"),
         };
-        tx.commit().await?;
-        self.acknowledge().await?;
-        Ok(Some(job))
-    }
-
-    /// Reschedule an unfinished job (change not visible yet, or a transient
-    /// failure): 5 s after the first attempt, doubling to a 300 s cap. Applies
-    /// only while `attempt` is still the job's latest claim, so a stale worker
-    /// cannot shorten another worker's lease.
-    pub async fn defer_job(&self, id: i64, attempt: i32) -> Result<(), StoreError> {
-        sqlx::query("UPDATE outbox SET next_attempt_at=now()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,GREATEST(attempts-1,0))))::int) WHERE id=$1 AND attempts=$2 AND completed_at IS NULL")
-            .bind(id)
-            .bind(attempt)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Mark a job done, only while `attempt` is still its latest claim.
-    pub async fn complete_job(&self, id: i64, attempt: i32) -> Result<(), StoreError> {
-        self.verify_integrity().await?;
-        sqlx::query("UPDATE outbox SET completed_at=now() WHERE id=$1 AND attempts=$2 AND completed_at IS NULL")
-            .bind(id)
-            .bind(attempt)
-            .execute(&self.pool)
+        // Serialize provider writes with placement moves and retirement for
+        // the whole attempt, including DNS observation.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(job.installation_id.to_string())
+            .execute(&mut *tx)
             .await?;
         self.acknowledge().await?;
-        Ok(())
+        Ok(Some(ClaimedJob { tx, job }))
     }
 
     pub async fn allocate(
