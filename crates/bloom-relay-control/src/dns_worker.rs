@@ -71,22 +71,29 @@ impl DnsWorker {
                 bloom_relay_observe::gauge("bloom_relay_dns_job_lag_seconds", seconds.max(0.0));
             }
             match self.store.claim_job(&self.placement, self.scope).await {
-                Ok(Some(job)) => {
-                    let id = job.id;
-                    match self.process(job).await {
-                        Ok(true) => {
+                Ok(Some(claimed)) => {
+                    // The claim holds the job and the installation lock until
+                    // its outcome is recorded below.
+                    let id = claimed.job.id;
+                    let outcome = match self.process(&claimed.job).await {
+                        Ok(true) => claimed.complete(&self.store).await.map(|()| {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_completed_total");
-                            if let Err(error) = self.store.complete_job(id).await {
-                                tracing::warn!(job_id=id, error=%error, "DNS job completion failed");
-                            }
-                        }
+                        }),
                         Ok(false) => {
-                            bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total")
+                            bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total");
+                            claimed.defer(&self.store).await
                         }
                         Err(error) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_failed_total");
                             tracing::warn!(job_id=id, error=%error, "DNS job will retry");
+                            claimed.defer(&self.store).await
                         }
+                    };
+                    // Unrecorded, the attempt rolls back: the job is free
+                    // again and retried at its existing schedule.
+                    if let Err(error) = outcome {
+                        tracing::warn!(job_id=id, error=%error, "DNS job outcome not recorded");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -100,24 +107,7 @@ impl DnsWorker {
 
     async fn process(
         &self,
-        job: OutboxJob,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        // Serialize provider writes with operator placement moves. The advisory
-        // lock has transaction lifetime, including DNS observation.
-        let mut lock = self.store.pool().begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(job.installation_id.to_string())
-            .execute(&mut *lock)
-            .await?;
-        let result = self.process_locked(job).await;
-        self.store.verify_integrity().await?;
-        lock.commit().await?;
-        result
-    }
-
-    async fn process_locked(
-        &self,
-        job: OutboxJob,
+        job: &OutboxJob,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let installation = job.installation_id;
         if !job_allowed(self.scope, &job.kind) {

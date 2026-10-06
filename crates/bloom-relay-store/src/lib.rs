@@ -62,6 +62,44 @@ pub struct OutboxJob {
     pub payload: serde_json::Value,
 }
 
+/// A job held for one attempt. Its transaction keeps the outbox row locked
+/// (other workers skip it) and the installation's lock held (placement moves
+/// and retirement wait) until the attempt is recorded with `complete` or
+/// `defer`. Dropping it, or the process dying, rolls back and frees the job
+/// for an immediate retry.
+pub struct ClaimedJob {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    pub job: OutboxJob,
+}
+
+impl ClaimedJob {
+    /// Record the job as done and release it.
+    pub async fn complete(mut self, store: &Store) -> Result<(), StoreError> {
+        store.verify_integrity().await?;
+        sqlx::query("UPDATE outbox SET completed_at=statement_timestamp() WHERE id=$1")
+            .bind(self.job.id)
+            .execute(&mut *self.tx)
+            .await?;
+        self.tx.commit().await?;
+        store.acknowledge().await
+    }
+
+    /// Record an unfinished attempt (change not visible yet, or a transient
+    /// failure) and release the job: retried 5 s after the first attempt,
+    /// doubling to a 300 s cap. Timed from now, not the transaction's start
+    /// (`now()`), which precedes the whole attempt. Like every write, it is
+    /// refused (and the claim rolled back) if the restore witness fails.
+    pub async fn defer(mut self, store: &Store) -> Result<(), StoreError> {
+        store.verify_integrity().await?;
+        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=statement_timestamp()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,attempts)))::int) WHERE id=$1")
+            .bind(self.job.id)
+            .execute(&mut *self.tx)
+            .await?;
+        self.tx.commit().await?;
+        store.acknowledge().await
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DnsJobScope {
     Serving,
@@ -293,6 +331,25 @@ impl Store {
         let row = sqlx::query("SELECT c.generation FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.token_hash=$3 AND c.revoked_at IS NULL AND c.expires_at > now() AND i.state='dns_ready' ORDER BY c.generation DESC LIMIT 1")
             .bind(installation_id).bind(scope).bind(digest.as_slice()).fetch_optional(&self.pool).await?;
         Ok(row.map(|row| row.get::<i64, _>("generation") as u64))
+    }
+
+    /// Authenticate a scoped bearer and report its installation's state in
+    /// one snapshot: `Some((generation, state))` for a current credential.
+    /// Lets a caller tell an early request (serving DNS still pending) from an
+    /// unauthorized one without racing the transition to `dns_ready`.
+    pub async fn authenticate_bearer_with_state(
+        &self,
+        installation_id: Uuid,
+        scope: &str,
+        bearer: &str,
+    ) -> Result<Option<(u64, String)>, StoreError> {
+        if bearer.len() < 43 || bearer.len() > 128 || !matches!(scope, "tunnel" | "dns_challenge") {
+            return Ok(None);
+        }
+        let digest = Sha256::digest(bearer.as_bytes());
+        let row = sqlx::query("SELECT c.generation, i.state FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.token_hash=$3 AND c.revoked_at IS NULL AND c.expires_at > now() ORDER BY c.generation DESC LIMIT 1")
+            .bind(installation_id).bind(scope).bind(digest.as_slice()).fetch_optional(&self.pool).await?;
+        Ok(row.map(|row| (row.get::<i64, _>("generation") as u64, row.get("state"))))
     }
 
     pub async fn hostname(&self, installation_id: Uuid) -> Result<Option<String>, StoreError> {
@@ -694,39 +751,34 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Claim the next due job and hold it for one attempt (see `ClaimedJob`).
+    /// Lock order: the job row, then the installation lock; nothing else
+    /// takes an outbox row lock, so waiting here cannot deadlock.
     pub async fn claim_job(
         &self,
         placement: &str,
         scope: DnsJobScope,
-    ) -> Result<Option<OutboxJob>, StoreError> {
+    ) -> Result<Option<ClaimedJob>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT o.id, o.installation_id, o.kind, o.payload FROM outbox o JOIN installations i USING (installation_id) WHERE i.placement=$1 AND (($2='serving' AND o.kind IN ('publish_name','remove_records')) OR ($2='challenge' AND o.kind IN ('reconcile_txt','remove_txt_all'))) AND o.completed_at IS NULL AND o.next_attempt_at<=now() ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
             .bind(placement).bind(scope.as_str()).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let id: i64 = row.get("id");
-        sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=now()+make_interval(secs=>GREATEST(60,LEAST(300,POWER(2,LEAST(8,attempts+1)))::int)) WHERE id=$1")
-            .bind(id).execute(&mut *tx).await?;
         let job = OutboxJob {
-            id,
+            id: row.get("id"),
             installation_id: row.get("installation_id"),
             kind: row.get("kind"),
             payload: row.get("payload"),
         };
-        tx.commit().await?;
-        self.acknowledge().await?;
-        Ok(Some(job))
-    }
-
-    pub async fn complete_job(&self, id: i64) -> Result<(), StoreError> {
-        self.verify_integrity().await?;
-        sqlx::query("UPDATE outbox SET completed_at=now() WHERE id=$1")
-            .bind(id)
-            .execute(&self.pool)
+        // Serialize provider writes with placement moves and retirement for
+        // the whole attempt, including DNS observation.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(job.installation_id.to_string())
+            .execute(&mut *tx)
             .await?;
         self.acknowledge().await?;
-        Ok(())
+        Ok(Some(ClaimedJob { tx, job }))
     }
 
     pub async fn allocate(

@@ -625,13 +625,83 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
             .unwrap()
             .is_none()
     );
-    let first_job = store
-        .claim_job(&first_placement, DnsJobScope::Serving)
+    let claim = || async {
+        store
+            .claim_job(&first_placement, DnsJobScope::Serving)
+            .await
+            .unwrap()
+    };
+    let first_job = claim().await.unwrap();
+    assert_eq!(first_job.job.installation_id, id);
+    let job_id = first_job.job.id;
+    // A claim holds the job for its whole attempt: no other worker takes it,
+    // however long the attempt runs.
+    assert!(claim().await.is_none(), "a held job is not claimed twice");
+    // An attempt that ends without recording an outcome (worker crash,
+    // dropped connection) frees the job for an immediate retry.
+    drop(first_job);
+    let retried = claim().await.expect("a released job is claimable again");
+    assert_eq!(retried.job.id, job_id);
+    // Deferring records the attempt: 5 s after the first, doubling.
+    let schedule = || async {
+        sqlx::query_as::<_, (i32, f64)>(
+            "SELECT attempts, extract(epoch FROM next_attempt_at-now())::double precision FROM outbox WHERE id=$1",
+        )
+        .bind(job_id)
+        .fetch_one(store.pool())
         .await
         .unwrap()
+    };
+    let make_due = || async {
+        sqlx::query("UPDATE outbox SET next_attempt_at=now() WHERE id=$1")
+            .bind(job_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    };
+    retried.defer(&store).await.unwrap();
+    let (attempts, retry_in) = schedule().await;
+    assert_eq!(attempts, 1);
+    assert!((3.0..=5.5).contains(&retry_in), "{retry_in}");
+    assert!(
+        claim().await.is_none(),
+        "a deferred job waits for its retry"
+    );
+    make_due().await;
+    // The backoff runs from the end of the attempt, however long it took.
+    let slow = claim().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    slow.defer(&store).await.unwrap();
+    let (attempts, retry_in) = schedule().await;
+    assert_eq!(attempts, 2);
+    assert!((9.0..=10.5).contains(&retry_in), "{retry_in}");
+    make_due().await;
+    // A held job also holds its installation lock, so a placement move waits
+    // for the attempt to finish.
+    let held = claim().await.unwrap();
+    let mut mover = store.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout='200ms'")
+        .execute(&mut *mover)
+        .await
         .unwrap();
-    assert_eq!(first_job.installation_id, id);
-    store.complete_job(first_job.id).await.unwrap();
+    assert!(
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(id.to_string())
+            .execute(&mut *mover)
+            .await
+            .is_err(),
+        "the installation lock is held for the attempt"
+    );
+    mover.rollback().await.unwrap();
+    held.complete(&store).await.unwrap();
+    let completed: bool =
+        sqlx::query_scalar("SELECT completed_at IS NOT NULL FROM outbox WHERE id=$1")
+            .bind(job_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert!(completed);
+    assert!(claim().await.is_none());
     store
         .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
         .await
@@ -675,8 +745,8 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(job.installation_id, id);
-    assert_eq!(job.kind, "publish_name");
+    assert_eq!(job.job.installation_id, id);
+    assert_eq!(job.job.kind, "publish_name");
     assert_eq!(
         store.allocation_status(id).await.unwrap().unwrap().hostname,
         allocation.hostname
@@ -734,7 +804,34 @@ async fn stale_database_revision_is_rejected_by_external_witness() {
         .parse()
         .unwrap();
     assert!(concurrent_marker >= marker + 2);
+    // A DNS attempt claimed before the witness goes stale records nothing.
+    let placement = format!("witness-{}", Uuid::new_v4().simple());
+    guarded
+        .allocate(Uuid::new_v4(), [7u8; 32], &placement)
+        .await
+        .unwrap();
+    let claimed = guarded
+        .claim_job(&placement, DnsJobScope::Serving)
+        .await
+        .unwrap()
+        .unwrap();
+    let job_id = claimed.job.id;
     std::fs::write(&path, format!("{}\n", advanced + 1_000_000)).unwrap();
+    assert!(matches!(
+        claimed.defer(&guarded).await,
+        Err(StoreError::Witness(_))
+    ));
+    let (attempts, due): (i32, bool) =
+        sqlx::query_as("SELECT attempts, next_attempt_at<=now() FROM outbox WHERE id=$1")
+            .bind(job_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (attempts, due),
+        (0, true),
+        "a refused deferral is rolled back"
+    );
     assert!(matches!(
         witness.verify_and_advance(&store).await,
         Err(WitnessError::StaleDatabase)
