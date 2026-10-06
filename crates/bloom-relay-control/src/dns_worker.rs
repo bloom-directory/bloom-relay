@@ -81,12 +81,12 @@ impl DnsWorker {
                         }),
                         Ok(false) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total");
-                            claimed.defer().await
+                            claimed.defer(&self.store).await
                         }
                         Err(error) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_failed_total");
                             tracing::warn!(job_id=id, error=%error, "DNS job will retry");
-                            claimed.defer().await
+                            claimed.defer(&self.store).await
                         }
                     };
                     // Unrecorded, the attempt rolls back: the job is free

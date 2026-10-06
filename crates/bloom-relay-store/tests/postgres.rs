@@ -659,7 +659,7 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
             .await
             .unwrap();
     };
-    retried.defer().await.unwrap();
+    retried.defer(&store).await.unwrap();
     let (attempts, retry_in) = schedule().await;
     assert_eq!(attempts, 1);
     assert!((3.0..=5.5).contains(&retry_in), "{retry_in}");
@@ -671,7 +671,7 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
     // The backoff runs from the end of the attempt, however long it took.
     let slow = claim().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    slow.defer().await.unwrap();
+    slow.defer(&store).await.unwrap();
     let (attempts, retry_in) = schedule().await;
     assert_eq!(attempts, 2);
     assert!((9.0..=10.5).contains(&retry_in), "{retry_in}");
@@ -804,7 +804,34 @@ async fn stale_database_revision_is_rejected_by_external_witness() {
         .parse()
         .unwrap();
     assert!(concurrent_marker >= marker + 2);
+    // A DNS attempt claimed before the witness goes stale records nothing.
+    let placement = format!("witness-{}", Uuid::new_v4().simple());
+    guarded
+        .allocate(Uuid::new_v4(), [7u8; 32], &placement)
+        .await
+        .unwrap();
+    let claimed = guarded
+        .claim_job(&placement, DnsJobScope::Serving)
+        .await
+        .unwrap()
+        .unwrap();
+    let job_id = claimed.job.id;
     std::fs::write(&path, format!("{}\n", advanced + 1_000_000)).unwrap();
+    assert!(matches!(
+        claimed.defer(&guarded).await,
+        Err(StoreError::Witness(_))
+    ));
+    let (attempts, due): (i32, bool) =
+        sqlx::query_as("SELECT attempts, next_attempt_at<=now() FROM outbox WHERE id=$1")
+            .bind(job_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (attempts, due),
+        (0, true),
+        "a refused deferral is rolled back"
+    );
     assert!(matches!(
         witness.verify_and_advance(&store).await,
         Err(WitnessError::StaleDatabase)

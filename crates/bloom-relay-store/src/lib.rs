@@ -87,14 +87,16 @@ impl ClaimedJob {
     /// Record an unfinished attempt (change not visible yet, or a transient
     /// failure) and release the job: retried 5 s after the first attempt,
     /// doubling to a 300 s cap. Timed from now, not the transaction's start
-    /// (`now()`), which precedes the whole attempt.
-    pub async fn defer(mut self) -> Result<(), StoreError> {
+    /// (`now()`), which precedes the whole attempt. Like every write, it is
+    /// refused (and the claim rolled back) if the restore witness fails.
+    pub async fn defer(mut self, store: &Store) -> Result<(), StoreError> {
+        store.verify_integrity().await?;
         sqlx::query("UPDATE outbox SET attempts=attempts+1, next_attempt_at=statement_timestamp()+make_interval(secs=>LEAST(300,5*POWER(2,LEAST(6,attempts)))::int) WHERE id=$1")
             .bind(self.job.id)
             .execute(&mut *self.tx)
             .await?;
         self.tx.commit().await?;
-        Ok(())
+        store.acknowledge().await
     }
 }
 
