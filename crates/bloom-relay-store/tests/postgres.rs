@@ -668,10 +668,13 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
         "a deferred job waits for its retry"
     );
     make_due().await;
-    claim().await.unwrap().defer().await.unwrap();
+    // The backoff runs from the end of the attempt, however long it took.
+    let slow = claim().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    slow.defer().await.unwrap();
     let (attempts, retry_in) = schedule().await;
     assert_eq!(attempts, 2);
-    assert!((8.0..=10.5).contains(&retry_in), "{retry_in}");
+    assert!((9.0..=10.5).contains(&retry_in), "{retry_in}");
     make_due().await;
     // A held job also holds its installation lock, so a placement move waits
     // for the attempt to finish.
