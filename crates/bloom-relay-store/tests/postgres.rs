@@ -668,7 +668,22 @@ async fn placement_move_fences_gateway_and_routes_dns_work() {
         .unwrap();
     let deferred = retry_in().await;
     assert!((3.0..=5.5).contains(&deferred), "{deferred}");
-    store.complete_job(first_job.id).await.unwrap();
+    // Completion is scoped to the claim too: a stale one changes nothing.
+    store
+        .complete_job(first_job.id, first_job.attempt - 1)
+        .await
+        .unwrap();
+    let completed: bool =
+        sqlx::query_scalar("SELECT completed_at IS NOT NULL FROM outbox WHERE id=$1")
+            .bind(first_job.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert!(!completed, "a stale claim must not complete the job");
+    store
+        .complete_job(first_job.id, first_job.attempt)
+        .await
+        .unwrap();
     store
         .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/123")
         .await

@@ -77,11 +77,9 @@ impl DnsWorker {
                         // Another claim took the job over (or completed it)
                         // while this one waited for the installation lock.
                         Ok(None) => {}
+                        // Completed inside `process`, under the installation lock.
                         Ok(Some(true)) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_completed_total");
-                            if let Err(error) = self.store.complete_job(id).await {
-                                tracing::warn!(job_id=id, error=%error, "DNS job completion failed");
-                            }
                         }
                         Ok(Some(false)) => {
                             bloom_relay_observe::count("bloom_relay_dns_jobs_pending_total");
@@ -137,7 +135,13 @@ impl DnsWorker {
             lock.commit().await?;
             return Ok(None);
         }
+        let (id, attempt) = (job.id, job.attempt);
         let result = self.process_locked(job).await.map(Some);
+        if matches!(result, Ok(Some(true))) {
+            // Complete while still holding the lock, and only for this claim,
+            // so a reclaim waiting on the lock always sees the job completed.
+            self.store.complete_job(id, attempt).await?;
+        }
         self.store.verify_integrity().await?;
         lock.commit().await?;
         result

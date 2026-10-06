@@ -757,10 +757,12 @@ impl Store {
         Ok(())
     }
 
-    pub async fn complete_job(&self, id: i64) -> Result<(), StoreError> {
+    /// Mark a job done, only while `attempt` is still its latest claim.
+    pub async fn complete_job(&self, id: i64, attempt: i32) -> Result<(), StoreError> {
         self.verify_integrity().await?;
-        sqlx::query("UPDATE outbox SET completed_at=now() WHERE id=$1")
+        sqlx::query("UPDATE outbox SET completed_at=now() WHERE id=$1 AND attempts=$2 AND completed_at IS NULL")
             .bind(id)
+            .bind(attempt)
             .execute(&self.pool)
             .await?;
         self.acknowledge().await?;
