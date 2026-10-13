@@ -182,6 +182,29 @@ request suffices. If all admin recovery authority is lost, do not reassign the
 old hostname: provision a new installation identity and use the wallet's existing
 credential/recovery protocol to regain access.
 
+### Scoped credential windows
+
+Tunnel and DNS-challenge bearers are short-lived and renewed by Broker with the
+current bearer; no admin key is involved. Two operator settings bound them:
+
+- **Validity** (`BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS`, default 24 hours,
+  allowed 12–24 hours): how long a renewed bearer lasts, and the cap on an
+  administrator-issued one. Broker and Signer reject receipts expiring more
+  than 24 hours out, and Broker renews six hours before expiry, so longer or
+  much shorter lifetimes need client changes first.
+- **Renewal grace** (`BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS`, default
+  7 days, allowed 0–90 days): how long after expiry the newest unrevoked bearer
+  may still renew. It covers a host asleep or offline through its renewal
+  window. During the grace an expired bearer can only renew; it never opens a
+  tunnel or calls the DNS API. Superseded, revoked and retired-installation
+  bearers never renew. `0` turns the grace off.
+
+The trade-off: a longer grace lets a laptop recover after a longer absence, but
+keeps a copied, expired bearer renewable for longer. A host past the grace
+needs `bloom-signer admin provision`, which re-issues bearers with the
+installation admin key and keeps the same hostname. Operational details are in
+[docs/operations.md](docs/operations.md).
+
 Proposed `/v1` control API operations: bootstrap challenge/enrollment, installation
 status, scoped credential renewal, ACME account registration/rebinding, DNS-01
 challenge ensure/readiness, certificate metadata publication, tunnel claim and

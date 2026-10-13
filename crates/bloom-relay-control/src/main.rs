@@ -12,14 +12,14 @@ use bloom_relay_protocol::{
     CredentialRenewRequest, DnsChallengeEnsureRequest, DnsChallengeState, ErrorCode, ErrorEnvelope,
     InstallationStatusRequest, RetireRequest, Scope, SignedRequest, WIRE_VERSION, sha256_hex,
 };
-use bloom_relay_store::{DnsJobScope, RestoreWitness, Store};
+use bloom_relay_store::{CredentialWindows, DnsJobScope, RestoreWitness, Store};
 use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
 use std::{
     env,
     net::SocketAddr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 mod client_addr;
@@ -88,6 +88,49 @@ fn acme_environment_from_env(
     }
 }
 
+/// Reads the scoped bearer lifetime and renewal grace, in whole seconds, from
+/// `BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS` (default 86400) and
+/// `BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS` (default 604800). A value
+/// that is set but malformed or out of range refuses startup.
+fn credential_windows_from_env(
+    validity: Result<String, env::VarError>,
+    renewal_grace: Result<String, env::VarError>,
+) -> Result<CredentialWindows, String> {
+    fn seconds(
+        name: &str,
+        value: Result<String, env::VarError>,
+        default: Duration,
+    ) -> Result<Duration, String> {
+        match value {
+            Err(env::VarError::NotPresent) => Ok(default),
+            Ok(raw) => raw
+                .parse::<u64>()
+                .map(Duration::from_secs)
+                .map_err(|_| format!("{name} must be a whole number of seconds")),
+            Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must be ASCII digits")),
+        }
+    }
+    let defaults = CredentialWindows::default();
+    let validity = seconds(
+        "BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS",
+        validity,
+        defaults.validity(),
+    )?;
+    let renewal_grace = seconds(
+        "BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS",
+        renewal_grace,
+        defaults.renewal_grace(),
+    )?;
+    CredentialWindows::new(validity, renewal_grace).map_err(|_| {
+        format!(
+            "BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS must be {}..={} and BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS at most {}",
+            CredentialWindows::MIN_VALIDITY.as_secs(),
+            CredentialWindows::MAX_VALIDITY.as_secs(),
+            CredentialWindows::MAX_RENEWAL_GRACE.as_secs()
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     rustls::crypto::ring::default_provider()
@@ -147,13 +190,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let receipt_signer = receipt_signer::ReceiptSigner::from_env().await?;
     let witness_path = env::var("BLOOM_RELAY_RESTORE_WITNESS_PATH")?;
     let acme_environment = configured_acme_environment()?;
+    let credential_windows = credential_windows_from_env(
+        env::var("BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS"),
+        env::var("BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS"),
+    )?;
+    tracing::info!(
+        validity_seconds = credential_windows.validity().as_secs(),
+        renewal_grace_seconds = credential_windows.renewal_grace().as_secs(),
+        "scoped credential windows"
+    );
     let state = Arc::new(AppState {
         store: Store::connect_runtime_with_witness(
             &env::var("BLOOM_RELAY_DATABASE_URL")?,
             witness_path.clone().into(),
         )
         .await?
-        .with_acme_environment(acme_environment),
+        .with_acme_environment(acme_environment)
+        .with_credential_windows(credential_windows),
         receipt_signer,
         audience,
         placement,
@@ -652,6 +705,44 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    #[test]
+    fn credential_windows_default_and_reject_unsafe_values() {
+        let unset = || Err(env::VarError::NotPresent);
+        let set = |value: &str| Ok(value.to_owned());
+        assert_eq!(
+            credential_windows_from_env(unset(), unset()).unwrap(),
+            CredentialWindows::default()
+        );
+        assert_eq!(CredentialWindows::default().validity().as_secs(), 86_400);
+        assert_eq!(
+            CredentialWindows::default().renewal_grace().as_secs(),
+            604_800
+        );
+        let custom = credential_windows_from_env(set("43200"), set("2592000")).unwrap();
+        assert_eq!(custom.validity().as_secs(), 43_200);
+        assert_eq!(custom.renewal_grace().as_secs(), 2_592_000);
+        assert_eq!(
+            credential_windows_from_env(unset(), set("0"))
+                .unwrap()
+                .renewal_grace(),
+            Duration::ZERO,
+            "zero turns the grace off"
+        );
+        for (validity, grace) in [
+            ("86401", "0"),       // clients reject receipts beyond 24 hours
+            ("43199", "0"),       // Broker would renew on every round
+            ("86400", "7776001"), // beyond 90 days
+            ("1d", "0"),
+            ("-1", "0"),
+            ("", "0"),
+        ] {
+            assert!(
+                credential_windows_from_env(set(validity), set(grace)).is_err(),
+                "{validity}/{grace}"
+            );
+        }
+    }
 
     #[test]
     fn acme_environment_configuration_is_strict_and_defaults_to_production() {

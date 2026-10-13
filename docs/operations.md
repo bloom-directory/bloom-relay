@@ -89,6 +89,20 @@ relay names that have no exact per-installation CAA. Do not put this policy at
 authority to modify the parent policy. Confirm authoritative and recursive CAA
 answers before enrollment and after a retirement.
 
+The control API issues and renews scoped tunnel and DNS-challenge bearers with
+two windows, both in whole seconds; leaving them unset keeps the defaults:
+
+| Variable | Default | Allowed | Meaning |
+| --- | --- | --- | --- |
+| `BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS` | `86400` (24 h) | `43200`–`86400` | Lifetime of a renewed bearer; caps an issued one |
+| `BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS` | `604800` (7 days) | `0`–`7776000` (90 days) | How long after expiry the newest bearer may still renew; `0` turns it off |
+
+A malformed or out-of-range value fails startup, and the effective values are
+logged as `scoped credential windows`. Changes apply to the next issue or
+renewal; existing bearers keep their recorded expiry. The grace is read when a
+renewal arrives, so shortening it can strand a host that is already past the
+new window: that host recovers only with `bloom-signer admin provision`.
+
 The control API defaults to Let's Encrypt production account registration.
 Set `BLOOM_RELAY_ACME_ENVIRONMENT=staging` only for an explicitly reviewed
 staging issuance exercise while enrollment is closed, and allocate a fresh test
