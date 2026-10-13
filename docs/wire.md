@@ -72,7 +72,7 @@ Renewal revokes the old scoped bearer and immediately fences an old tunnel
 lease. Broker writes the next token to an owner-only staging file before the
 request, then atomically replaces the active file after the receipt. No admin
 key is needed for routine renewal. The newest unrevoked bearer for a scope may
-still renew for a grace period after it expires (seven days by default), so a
+still renew for a grace period after it expires (30 days by default), so a
 Broker that was asleep or offline through its renewal window recovers on its
 next attempt; the relay audits that as `credential_renewed_after_expiry`. An
 expired bearer never opens a tunnel or calls the DNS API, and a superseded or

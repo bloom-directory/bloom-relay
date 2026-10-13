@@ -95,7 +95,7 @@ two windows, both in whole seconds; leaving them unset keeps the defaults:
 | Variable | Default | Allowed | Meaning |
 | --- | --- | --- | --- |
 | `BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS` | `86400` (24 h) | `43200`–`86400` | Lifetime of a renewed bearer; caps an issued one |
-| `BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS` | `604800` (7 days) | `0`–`7776000` (90 days) | How long after expiry the newest bearer may still renew; `0` turns it off |
+| `BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS` | `2592000` (30 days) | `0`–`7776000` (90 days) | How long after expiry the newest bearer may still renew; `0` turns it off |
 
 A malformed or out-of-range value fails startup, and the effective values are
 logged as `scoped credential windows`. Changes apply to the next issue or

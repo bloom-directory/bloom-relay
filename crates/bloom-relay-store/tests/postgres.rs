@@ -1211,7 +1211,7 @@ async fn the_newest_credential_renews_within_the_grace_period_after_expiry() {
     ));
 
     // Past the grace period nothing renews.
-    expire(renewed, "8 days").await;
+    expire(renewed, "31 days").await;
     assert!(matches!(
         store
             .renew_bearer(

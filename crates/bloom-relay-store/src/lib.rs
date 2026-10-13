@@ -83,11 +83,11 @@ impl CredentialWindows {
 }
 
 impl Default for CredentialWindows {
-    /// 24-hour bearers that may renew for seven days after expiry.
+    /// 24-hour bearers that may renew for 30 days after expiry.
     fn default() -> Self {
         Self {
             validity: Self::MAX_VALIDITY,
-            renewal_grace: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            renewal_grace: std::time::Duration::from_secs(30 * 24 * 60 * 60),
         }
     }
 }

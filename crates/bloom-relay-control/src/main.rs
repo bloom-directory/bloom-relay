@@ -90,7 +90,7 @@ fn acme_environment_from_env(
 
 /// Reads the scoped bearer lifetime and renewal grace, in whole seconds, from
 /// `BLOOM_RELAY_CREDENTIAL_VALIDITY_SECONDS` (default 86400) and
-/// `BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS` (default 604800). A value
+/// `BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS` (default 2592000). A value
 /// that is set but malformed or out of range refuses startup.
 fn credential_windows_from_env(
     validity: Result<String, env::VarError>,
@@ -717,11 +717,11 @@ mod tests {
         assert_eq!(CredentialWindows::default().validity().as_secs(), 86_400);
         assert_eq!(
             CredentialWindows::default().renewal_grace().as_secs(),
-            604_800
+            2_592_000
         );
-        let custom = credential_windows_from_env(set("43200"), set("2592000")).unwrap();
+        let custom = credential_windows_from_env(set("43200"), set("1209600")).unwrap();
         assert_eq!(custom.validity().as_secs(), 43_200);
-        assert_eq!(custom.renewal_grace().as_secs(), 2_592_000);
+        assert_eq!(custom.renewal_grace().as_secs(), 1_209_600);
         assert_eq!(
             credential_windows_from_env(unset(), set("0"))
                 .unwrap()

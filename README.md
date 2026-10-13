@@ -193,7 +193,7 @@ current bearer; no admin key is involved. Two operator settings bound them:
   than 24 hours out, and Broker renews six hours before expiry, so longer or
   much shorter lifetimes need client changes first.
 - **Renewal grace** (`BLOOM_RELAY_CREDENTIAL_RENEWAL_GRACE_SECONDS`, default
-  7 days, allowed 0–90 days): how long after expiry the newest unrevoked bearer
+  30 days, allowed 0–90 days): how long after expiry the newest unrevoked bearer
   may still renew. It covers a host asleep or offline through its renewal
   window. During the grace an expired bearer can only renew; it never opens a
   tunnel or calls the DNS API. Superseded, revoked and retired-installation
