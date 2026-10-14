@@ -36,15 +36,68 @@ pub enum StoreError {
     Witness(String),
 }
 
-/// How long after expiry the newest scoped credential may still renew
-/// itself. Covers a host asleep or offline through its renewal window.
-pub const RENEWAL_GRACE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+/// Lifetime and renewal grace for scoped tunnel and DNS-challenge bearers.
+///
+/// `validity` is how long a renewed bearer lasts, and caps an issued one.
+/// Broker and Signer reject receipts expiring more than 24 hours out, and
+/// Broker renews six hours before expiry, so it stays within 12–24 hours.
+/// `renewal_grace` is how long after expiry the newest bearer may still renew
+/// itself (and only renew), covering a host asleep or offline through its
+/// renewal window; zero turns it off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialWindows {
+    validity: std::time::Duration,
+    renewal_grace: std::time::Duration,
+}
+
+impl CredentialWindows {
+    pub const MIN_VALIDITY: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+    pub const MAX_VALIDITY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    pub const MAX_RENEWAL_GRACE: std::time::Duration =
+        std::time::Duration::from_secs(90 * 24 * 60 * 60);
+
+    pub fn new(
+        validity: std::time::Duration,
+        renewal_grace: std::time::Duration,
+    ) -> Result<Self, StoreError> {
+        if !(Self::MIN_VALIDITY..=Self::MAX_VALIDITY).contains(&validity)
+            || renewal_grace > Self::MAX_RENEWAL_GRACE
+            || validity.subsec_nanos() != 0
+            || renewal_grace.subsec_nanos() != 0
+        {
+            return Err(StoreError::InvalidRequest);
+        }
+        Ok(Self {
+            validity,
+            renewal_grace,
+        })
+    }
+
+    pub fn validity(&self) -> std::time::Duration {
+        self.validity
+    }
+
+    pub fn renewal_grace(&self) -> std::time::Duration {
+        self.renewal_grace
+    }
+}
+
+impl Default for CredentialWindows {
+    /// 24-hour bearers that may renew for 30 days after expiry.
+    fn default() -> Self {
+        Self {
+            validity: Self::MAX_VALIDITY,
+            renewal_grace: std::time::Duration::from_secs(30 * 24 * 60 * 60),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
     witness: Option<Arc<RestoreWitness>>,
     acme_environment: AcmeEnvironment,
+    credential_windows: CredentialWindows,
 }
 
 /// The result of ensuring a challenge value.
@@ -147,6 +200,7 @@ impl Store {
             pool,
             witness: None,
             acme_environment: AcmeEnvironment::Production,
+            credential_windows: CredentialWindows::default(),
         })
     }
 
@@ -193,6 +247,7 @@ impl Store {
                     .map_err(|error| StoreError::Witness(error.to_string()))?,
             )),
             acme_environment: AcmeEnvironment::Production,
+            credential_windows: CredentialWindows::default(),
         };
         store.acknowledge().await?;
         Ok(store)
@@ -220,6 +275,12 @@ impl Store {
     /// environment. Existing owner-bound rows remain readable by runtime workers.
     pub fn with_acme_environment(mut self, environment: AcmeEnvironment) -> Self {
         self.acme_environment = environment;
+        self
+    }
+
+    /// Sets scoped bearer lifetime and renewal grace (see [`CredentialWindows`]).
+    pub fn with_credential_windows(mut self, windows: CredentialWindows) -> Self {
+        self.credential_windows = windows;
         self
     }
 
@@ -409,8 +470,10 @@ impl Store {
         let generation: i64 = row.get("generation");
         sqlx::query("UPDATE scoped_bearer_credentials SET revoked_at=now() WHERE installation_id=$1 AND scope=$2 AND revoked_at IS NULL")
             .bind(installation_id).bind(scope).execute(&mut *tx).await?;
+        // The administrator's requested lifetime, capped by the configured one.
+        let lifetime = validity_seconds.min(self.credential_windows.validity.as_secs() as i32);
         let expiry = sqlx::query("INSERT INTO scoped_bearer_credentials(installation_id,scope,generation,token_hash,expires_at) VALUES ($1,$2,$3,$4,now()+make_interval(secs=>$5)) RETURNING (extract(epoch FROM expires_at)*1000)::bigint AS expires_at_ms")
-            .bind(installation_id).bind(scope).bind(generation).bind(token_hash.as_slice()).bind(validity_seconds).fetch_one(&mut *tx).await?;
+            .bind(installation_id).bind(scope).bind(generation).bind(token_hash.as_slice()).bind(lifetime).fetch_one(&mut *tx).await?;
         let expires_at_ms: i64 = expiry.get("expires_at_ms");
         if scope == "tunnel" {
             sqlx::query("DELETE FROM tunnel_leases WHERE installation_id=$1")
@@ -480,13 +543,13 @@ impl Store {
         .bind(installation_id)
         .execute(&mut *tx)
         .await?;
-        // A credential may renew for RENEWAL_GRACE after it expires, so a
+        // A credential may renew for the configured grace after it expires, so a
         // Broker that slept through its renewal window recovers on wake. Only
         // the newest unrevoked credential for the scope qualifies, so a
         // superseded token can never renew; an expired one still cannot open
         // a tunnel (`authenticate_bearer` requires an unexpired credential).
         let row = sqlx::query("SELECT c.token_hash, c.expires_at<=now() AS expired FROM scoped_bearer_credentials c JOIN installations i USING (installation_id) WHERE c.installation_id=$1 AND c.scope=$2 AND c.generation=$3 AND c.revoked_at IS NULL AND c.expires_at>now()-make_interval(secs => $4) AND i.state='dns_ready' AND NOT EXISTS (SELECT 1 FROM scoped_bearer_credentials n WHERE n.installation_id=c.installation_id AND n.scope=c.scope AND n.generation>c.generation) FOR UPDATE OF c")
-            .bind(installation_id).bind(scope).bind(generation as i64).bind(RENEWAL_GRACE.as_secs_f64()).fetch_optional(&mut *tx).await?.ok_or(StoreError::Unauthorized)?;
+            .bind(installation_id).bind(scope).bind(generation as i64).bind(self.credential_windows.renewal_grace.as_secs_f64()).fetch_optional(&mut *tx).await?.ok_or(StoreError::Unauthorized)?;
         let renewed_after_expiry: bool = row.get("expired");
         let observed: Vec<u8> = row.get("token_hash");
         if observed != old_hash.as_slice() {
@@ -497,8 +560,8 @@ impl Store {
         let next: i64 = row.get("generation");
         sqlx::query("UPDATE scoped_bearer_credentials SET revoked_at=now() WHERE installation_id=$1 AND scope=$2 AND generation=$3")
             .bind(installation_id).bind(scope).bind(generation as i64).execute(&mut *tx).await?;
-        let expiry = sqlx::query("INSERT INTO scoped_bearer_credentials(installation_id,scope,generation,token_hash,expires_at) VALUES ($1,$2,$3,$4,now()+interval '24 hours') RETURNING (extract(epoch FROM expires_at)*1000)::bigint AS expires_at_ms")
-            .bind(installation_id).bind(scope).bind(next).bind(new_token_hash.as_slice()).fetch_one(&mut *tx).await?;
+        let expiry = sqlx::query("INSERT INTO scoped_bearer_credentials(installation_id,scope,generation,token_hash,expires_at) VALUES ($1,$2,$3,$4,now()+make_interval(secs=>$5)) RETURNING (extract(epoch FROM expires_at)*1000)::bigint AS expires_at_ms")
+            .bind(installation_id).bind(scope).bind(next).bind(new_token_hash.as_slice()).bind(self.credential_windows.validity.as_secs() as i32).fetch_one(&mut *tx).await?;
         let expires_at_ms: i64 = expiry.get("expires_at_ms");
         if scope == "tunnel" {
             sqlx::query("DELETE FROM tunnel_leases WHERE installation_id=$1")

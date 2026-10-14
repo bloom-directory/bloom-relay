@@ -63,7 +63,7 @@ check after claiming its ticket. A stream already accepted before a later
 generation claim may drain under the normal 30-minute stream bound; no new
 stream can attach to the fenced generation.
 
-The privileged administrator issues a 24-hour random bearer by sending only
+The privileged administrator issues a random bearer (24 hours by default) by sending only
 its SHA-256 digest in a signed request. The receipt gives the exact database
 generation and expiry. Broker renews with its current scoped bearer, a new
 digest and a caller-persisted operation ID; retries with identical values are
@@ -72,10 +72,13 @@ Renewal revokes the old scoped bearer and immediately fences an old tunnel
 lease. Broker writes the next token to an owner-only staging file before the
 request, then atomically replaces the active file after the receipt. No admin
 key is needed for routine renewal. The newest unrevoked bearer for a scope may
-still renew for seven days after it expires (`RENEWAL_GRACE`), so a Broker that
-was asleep or offline through its renewal window recovers on its next attempt;
-the relay audits that as `credential_renewed_after_expiry`. An expired bearer
-never opens a tunnel, and a superseded or longer-expired one never renews.
+still renew for a grace period after it expires (30 days by default), so a
+Broker that was asleep or offline through its renewal window recovers on its
+next attempt; the relay audits that as `credential_renewed_after_expiry`. An
+expired bearer never opens a tunnel or calls the DNS API, and a superseded or
+longer-expired one never renews. Both windows are operator settings (see
+"Scoped credential windows" in the README); the issued lifetime is the
+administrator's request capped by the configured one.
 
 The gateway uses rustls's ClientHello acceptor only to extract exact SNI.
 Before reading ClientHello it admits at most 120 new ingress connections per

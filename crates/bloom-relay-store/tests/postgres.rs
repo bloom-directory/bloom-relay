@@ -1,5 +1,7 @@
 use bloom_relay_protocol::{AcmeEnvironment, CertificateMetadata};
-use bloom_relay_store::{DnsJobScope, RestoreWitness, Store, StoreError, WitnessError};
+use bloom_relay_store::{
+    CredentialWindows, DnsJobScope, RestoreWitness, Store, StoreError, WitnessError,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -977,6 +979,143 @@ async fn restore_fence_triggers_advance_at_commit() {
     );
 }
 
+/// Configured windows: renewal issues for the configured lifetime, issuance is
+/// capped by it, and the grace (here one day, then off) bounds renewal after
+/// expiry.
+#[tokio::test]
+async fn configured_credential_windows_bound_lifetime_and_renewal_grace() {
+    let Ok(url) = std::env::var("BLOOM_RELAY_TEST_DATABASE_URL") else {
+        return;
+    };
+    let windows = |validity_hours: u64, grace_hours: u64| {
+        CredentialWindows::new(
+            std::time::Duration::from_secs(validity_hours * 3600),
+            std::time::Duration::from_secs(grace_hours * 3600),
+        )
+        .unwrap()
+    };
+    let store = Store::connect(&url)
+        .await
+        .unwrap()
+        .with_credential_windows(windows(12, 24));
+    let id = store
+        .allocate(Uuid::new_v4(), [22u8; 32], "test-shard")
+        .await
+        .unwrap()
+        .installation_id;
+    store
+        .register_acme_account(id, "https://acme-v02.api.letsencrypt.org/acme/acct/124")
+        .await
+        .unwrap();
+    store.mark_dns_ready(id).await.unwrap();
+    let token = |byte: char| byte.to_string().repeat(43);
+    let hash = |token: &str| -> [u8; 32] { Sha256::digest(token.as_bytes()).into() };
+    let hours_left = |expires_at_ms: u64| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        (expires_at_ms as f64 - now) / 3_600_000.0
+    };
+    let expire = |generation: u64, ago: &'static str| {
+        let pool = store.pool().clone();
+        async move {
+            sqlx::query(
+                "UPDATE scoped_bearer_credentials SET expires_at=now()-$3::text::interval \
+                 WHERE installation_id=$1 AND scope='dns_challenge' AND generation=$2",
+            )
+            .bind(id)
+            .bind(generation as i64)
+            .bind(ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // An administrator asking for 24 hours gets the configured 12.
+    let (generation, expires) = store
+        .issue_bearer(
+            id,
+            Uuid::new_v4(),
+            "dns_challenge",
+            hash(&token('a')),
+            86_400,
+        )
+        .await
+        .unwrap();
+    assert!(
+        (11.9..=12.01).contains(&hours_left(expires)),
+        "{}",
+        hours_left(expires)
+    );
+    // Within the one-day grace it renews, for the configured 12 hours.
+    expire(generation, "23 hours").await;
+    let (renewed, expires) = store
+        .renew_bearer(
+            id,
+            Uuid::new_v4(),
+            "dns_challenge",
+            generation,
+            &token('a'),
+            hash(&token('b')),
+        )
+        .await
+        .unwrap();
+    assert!(
+        (11.9..=12.01).contains(&hours_left(expires)),
+        "{}",
+        hours_left(expires)
+    );
+    // Past it, nothing renews.
+    expire(renewed, "25 hours").await;
+    let renew = |store: Store, generation: u64, from: char, to: char| async move {
+        store
+            .renew_bearer(
+                id,
+                Uuid::new_v4(),
+                "dns_challenge",
+                generation,
+                &token(from),
+                hash(&token(to)),
+            )
+            .await
+    };
+    assert!(matches!(
+        renew(store.clone(), renewed, 'b', 'c').await,
+        Err(StoreError::Unauthorized)
+    ));
+    // With the grace off, even a just-expired credential cannot renew, but an
+    // unexpired one still can.
+    let strict = store.clone().with_credential_windows(windows(24, 0));
+    let (current, _) = strict
+        .issue_bearer(
+            id,
+            Uuid::new_v4(),
+            "dns_challenge",
+            hash(&token('d')),
+            86_400,
+        )
+        .await
+        .unwrap();
+    expire(current, "1 second").await;
+    assert!(matches!(
+        renew(strict.clone(), current, 'd', 'e').await,
+        Err(StoreError::Unauthorized)
+    ));
+    let (fresh, _) = strict
+        .issue_bearer(
+            id,
+            Uuid::new_v4(),
+            "dns_challenge",
+            hash(&token('f')),
+            86_400,
+        )
+        .await
+        .unwrap();
+    assert!(renew(strict, fresh, 'f', 'g').await.unwrap().0 > fresh);
+}
+
 /// A Broker that slept through its renewal window renews on wake: the newest
 /// credential may renew within the grace period after expiry, but an expired
 /// credential never opens a tunnel, and a superseded or long-expired one
@@ -1072,7 +1211,7 @@ async fn the_newest_credential_renews_within_the_grace_period_after_expiry() {
     ));
 
     // Past the grace period nothing renews.
-    expire(renewed, "8 days").await;
+    expire(renewed, "31 days").await;
     assert!(matches!(
         store
             .renew_bearer(
