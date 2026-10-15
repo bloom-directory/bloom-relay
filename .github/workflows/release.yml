@@ -11,7 +11,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  dependency-policy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check advisories bans licenses sources
+
   package:
+    needs: dependency-policy
     strategy:
       fail-fast: true
       matrix:
